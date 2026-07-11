@@ -1,31 +1,77 @@
 import json
 import re
 
+from json_repair import repair_json
+
+
+def _extract_brace_block(raw_text: str) -> str | None:
+    """Ilk dengeli {...} blogunu dondurur. String icindeki suslu parantezleri
+    saymamak icin tirnak/escape takibi yapar."""
+    start_idx = raw_text.find("{")
+    if start_idx == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start_idx, len(raw_text)):
+        ch = raw_text[i]
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return raw_text[start_idx : i + 1]
+    # Kapanmamis blok (muhtemelen max_tokens kesmesi): kalan kismi yine de dondur,
+    # asagida json_repair toparlamayi dener.
+    return raw_text[start_idx:]
+
 
 def parse_llm_json(raw_text: str) -> dict:
-    """LLM ciktisindan ilk gecerli JSON objesini ayiklar.
+    """LLM ciktisindan JSON objesi ayiklar.
 
-    Model bazen JSON'u markdown blogu icine alir veya basina/sonuna metin ekler;
-    bu yuzden once markdown blogu, sonra parantez sayarak ham blok denenir.
+    Modeller sik sik bozuk JSON uretir: string icinde ham satir sonu, kacissiz
+    tirnak, eksik virgul, max_tokens kesmesi... Sirasiyla denenir:
+      1. Markdown ```json``` blogu (varsa)
+      2. Dengeli {...} blogu, strict=False ile (string icindeki ham kontrol
+         karakterlerine izin verir)
+      3. json_repair ile onarim (eksik virgul/tirnak/kapanis parantezlerini duzeltir)
     """
+    candidates: list[str] = []
+
     match = re.search(r"```(?:json)?\s*(.*?)\s*```", raw_text, re.DOTALL)
     if match:
+        candidates.append(match.group(1).strip())
+
+    brace_block = _extract_brace_block(raw_text)
+    if brace_block:
+        candidates.append(brace_block)
+
+    for candidate in candidates:
         try:
-            return json.loads(match.group(1).strip())
+            result = json.loads(candidate, strict=False)
+            if isinstance(result, dict):
+                return result
         except json.JSONDecodeError:
             pass
 
-    start_idx = raw_text.find("{")
-    if start_idx == -1:
-        raise ValueError("Model cevabinda JSON bulunamadi.")
+    for candidate in candidates:
+        try:
+            result = json.loads(repair_json(candidate), strict=False)
+            if isinstance(result, dict) and result:
+                return result
+        except (json.JSONDecodeError, ValueError):
+            pass
 
-    brace_count = 0
-    for i in range(start_idx, len(raw_text)):
-        if raw_text[i] == "{":
-            brace_count += 1
-        elif raw_text[i] == "}":
-            brace_count -= 1
-            if brace_count == 0:
-                return json.loads(raw_text[start_idx : i + 1])
-
-    raise ValueError("Model cevabindaki JSON tamamlanmamis.")
+    raise ValueError("Model cevabindan gecerli bir JSON objesi ayiklanamadi.")

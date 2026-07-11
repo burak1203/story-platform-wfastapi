@@ -8,3 +8,5 @@ pydantic>=2.7
 pydantic-settings>=2.3
 PyJWT>=2.8
 bcrypt>=4.1
+json-repair>=0.30
+

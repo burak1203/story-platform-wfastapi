@@ -56,9 +56,20 @@ async def chat_json(model: str, system: str, user: str, temperature: float = 0.8
             )
         return response
 
-    response = await _with_retry(call, f"LLM cagrisi ({model})")
-    raw = response.choices[0].message.content or ""
-    return parse_llm_json(raw)
+    # Model gecerli JSON uretmezse bir kez daha sans ver (onarim da tutmazsa)
+    last_error: Exception | None = None
+    for attempt in range(2):
+        response = await _with_retry(call, f"LLM cagrisi ({model})")
+        choice = response.choices[0]
+        if choice.finish_reason == "length":
+            logger.warning("LLM cevabi max_tokens sinirinda kesildi; JSON onarimi denenecek.")
+        raw = choice.message.content or ""
+        try:
+            return parse_llm_json(raw)
+        except ValueError as exc:
+            last_error = exc
+            logger.warning("LLM ciktisi JSON olarak ayiklanamadi (deneme %d/2)", attempt + 1)
+    raise last_error
 
 
 async def chat_text(model: str, system: str, user: str, temperature: float = 0.4, max_tokens: int = 1024) -> str:
