@@ -31,7 +31,7 @@ export const useAuthStore = defineStore('auth', {
         localStorage.setItem('token', this.token!)
         this.setAxiosHeader()
       } catch (err: any) {
-        this.error = 'Giriş başarısız. Bilgilerinizi kontrol edin.'
+        this.error = err.response?.data?.detail || 'Giriş başarısız. Bilgilerinizi kontrol edin.'
         throw err
       } finally {
         this.isLoading = false
@@ -48,7 +48,8 @@ export const useAuthStore = defineStore('auth', {
         localStorage.setItem('token', this.token!)
         this.setAxiosHeader()
       } catch (err: any) {
-        this.error = 'Kayıt olunamadı. E-posta veya kullanıcı adı kullanılıyor olabilir.'
+        this.error =
+          err.response?.data?.detail || 'Kayıt olunamadı. E-posta veya kullanıcı adı kullanılıyor olabilir.'
         throw err
       } finally {
         this.isLoading = false

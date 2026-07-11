@@ -40,10 +40,13 @@ const handleRegister = async () => {
 
       <form @submit.prevent="handleRegister" class="flex flex-col gap-4">
         <div>
-          <label class="block text-sm font-medium text-slate-400 mb-1">Kullanıcı Adı</label>
+          <label class="block text-sm font-medium text-slate-400 mb-1"
+            >Kullanıcı Adı <span class="text-slate-500">(en az 3 karakter)</span></label
+          >
           <input
             v-model="username"
             type="text"
+            minlength="3"
             class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-3 text-gray-100 focus:outline-none focus:border-amber-500 transition-colors"
             required
           />
@@ -60,10 +63,13 @@ const handleRegister = async () => {
         </div>
 
         <div>
-          <label class="block text-sm font-medium text-slate-400 mb-1">Şifre</label>
+          <label class="block text-sm font-medium text-slate-400 mb-1"
+            >Şifre <span class="text-slate-500">(en az 6 karakter)</span></label
+          >
           <input
             v-model="password"
             type="password"
+            minlength="6"
             class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-3 text-gray-100 focus:outline-none focus:border-amber-500 transition-colors"
             required
           />
