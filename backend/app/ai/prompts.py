@@ -1,19 +1,29 @@
 """Prompt sablonlari.
 
-Ana fikir: modele hikayenin TAMAMI degil, damitilmis bir baglam verilir:
-  - kosan ozet (running summary)
-  - sadece son bolumun tam metni
+Baglam duzeni (bolum sayisi kac olursa olsun sinirli kalir):
+  - yazarin kalici talimatlari (style/negative prompt)
+  - TUM bolum ozetleri, kronolojik sirayla (her biri kisa; cok uzarsa en eskiler atlanir)
+  - gecmisten semantik olarak ilgili bolum alintilari (n-1/n/n+1)
+  - SON IKI bolumun tam metni (baglam kopmasin diye)
   - varlik kartlari (karakter/mekan/esya, SillyTavern lorebook mantigi)
-  - gerekiyorsa gecmisten semantik olarak ilgili bolum alintilari (n-1/n/n+1)
-Boylece bolum sayisi kac olursa olsun prompt boyutu sabit kalir.
+  - yazarin son duzenlemelerine dair notlar ("burada su degisti")
 """
 
+import json
+
 from ..models import Story
+
+# Baglam butcesi sabitleri
+SUMMARY_CHAR_CAP = 300        # tek bolum ozetinin prompta girecek azami uzunlugu
+MAX_SUMMARIES_IN_PROMPT = 60  # bundan fazlasi varsa en eskiler atlanir
+LAST_CHAPTER_CAP = 12000      # son bolumun tam metni icin karakter tavani
+PREV_CHAPTER_CAP = 6000       # sondan onceki bolum icin karakter tavani
 
 JSON_FORMAT_BLOCK = """[ÇIKTI FORMATI - KESİN KURAL]
 Cevabını SADECE aşağıdaki JSON formatında ver. JSON dışında tek bir kelime yazma:
 {
   "content": "Yazdığın bölümün tamamı (sadece yeni bölüm, öncekileri tekrar etme)...",
+  "chapter_summary": "Bu bölümde olanların 2-3 cümlelik özeti (kim ne yaptı, ne değişti)",
   "new_characters": [{"name": "Yeni Karakter Adı", "description": "Kim olduğu, fiziksel özelliği ve rolü"}],
   "updated_characters": [{"name": "Bilinen Karakterin Adı", "status_change": "Bu bölümde ne yaptı / durumu nasıl değişti"}],
   "new_locations": [{"name": "Yeni Mekan Adı", "description": "Atmosferi ve detayı"}],
@@ -25,30 +35,52 @@ Kurallar:
 - İlgili bir şey yoksa listeyi boş bırak: []"""
 
 
-def _truncate(text: str, limit: int) -> str:
-    if len(text) <= limit:
-        return text
-    return "..." + text[-limit:]
+def _head(text: str, limit: int) -> str:
+    text = text.strip()
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _tail(text: str, limit: int) -> str:
+    text = text.strip()
+    return text if len(text) <= limit else "..." + text[-limit:]
 
 
 def _entity_lines(entities, with_status: bool = False, desc_limit: int = 200) -> str:
     lines = []
     for e in entities:
-        desc = (e.description or "").strip()
-        if len(desc) > desc_limit:
-            desc = desc[:desc_limit] + "..."
-        line = f"- {e.name}: {desc}"
+        line = f"- {e.name}: {_head(e.description or '', desc_limit)}"
         if with_status and getattr(e, "status", None):
             line += f" (Güncel durumu: {e.status.strip()})"
         lines.append(line)
     return "\n".join(lines) if lines else "(henüz yok)"
 
 
-def build_chapter_system_prompt(story: Story, retrieved_block: str | None) -> str:
-    """Hem ilk bolum hem devam bolumleri icin tek sablon.
+def _summaries_block(story: Story) -> str | None:
+    summarized = [c for c in story.chapters if c.summary]
+    if not summarized:
+        return None
+    skipped = len(summarized) - MAX_SUMMARIES_IN_PROMPT
+    if skipped > 0:
+        summarized = summarized[skipped:]
+    lines = [f"Bölüm {c.index}: {_head(c.summary, SUMMARY_CHAR_CAP)}" for c in summarized]
+    header = ""
+    if skipped > 0:
+        header = f"(en eski {skipped} bölümün özeti atlandı; gerekirse 'geçmiş sahneler' bloğuna bak)\n"
+    return header + "\n".join(lines)
 
-    Ilk bolumde ozet/son bolum/varlik bloklari bos olacagi icin dogal olarak sadelesir.
-    """
+
+def parse_edit_notes(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    try:
+        notes = json.loads(raw)
+        return [str(n) for n in notes if str(n).strip()]
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def build_chapter_system_prompt(story: Story, retrieved_block: str | None) -> str:
+    """Hem ilk bolum hem devam bolumleri icin tek sablon."""
     parts: list[str] = [
         "[KİMLİK VE TON]\n"
         "Sen usta, yaratıcı ve sürükleyici bir yazarsın. Betimlemelerin güçlü, diyalogların doğaldır. "
@@ -56,8 +88,18 @@ def build_chapter_system_prompt(story: Story, retrieved_block: str | None) -> st
         f"[HİKAYE BAŞLIĞI]\n{story.title}",
     ]
 
-    if story.running_summary:
-        parts.append(f"[ŞU ANA KADARKİ HİKAYENİN ÖZETİ]\n{story.running_summary.strip()}")
+    if story.style_prompt and story.style_prompt.strip():
+        parts.append(
+            "[YAZARIN KALICI TALİMATI - HER BÖLÜMDE UYGULA]\n" + story.style_prompt.strip()
+        )
+    if story.negative_prompt and story.negative_prompt.strip():
+        parts.append(
+            "[YASAKLAR - BUNLARDAN KESİNLİKLE KAÇIN]\n" + story.negative_prompt.strip()
+        )
+
+    summaries = _summaries_block(story)
+    if summaries:
+        parts.append("[BÖLÜM ÖZETLERİ - KRONOLOJİK]\n" + summaries)
 
     if retrieved_block:
         parts.append(
@@ -67,20 +109,37 @@ def build_chapter_system_prompt(story: Story, retrieved_block: str | None) -> st
 
     if story.chapters:
         last = story.chapters[-1]
-        parts.append(f"[SON BÖLÜM (Bölüm {last.index}) - TAM METİN]\n{_truncate(last.content, 15000)}")
-
-    if story.chapters:
+        if len(story.chapters) >= 2:
+            prev = story.chapters[-2]
+            parts.append(
+                f"[ÖNCEKİ BÖLÜM (Bölüm {prev.index}) - TAM METİN]\n{_tail(prev.content, PREV_CHAPTER_CAP)}"
+            )
+        parts.append(
+            f"[SON BÖLÜM (Bölüm {last.index}) - TAM METİN]\n{_tail(last.content, LAST_CHAPTER_CAP)}"
+        )
         parts.append(
             "[BİLİNEN EVREN]\n"
             f"Karakterler:\n{_entity_lines(story.characters, with_status=True)}\n\n"
             f"Mekanlar:\n{_entity_lines(story.locations)}\n\n"
             f"Eşyalar:\n{_entity_lines(story.items)}"
         )
+
+    edit_notes = parse_edit_notes(story.pending_edit_notes)
+    if edit_notes:
+        parts.append(
+            "[YAZARIN SON DÜZENLEMELERİ - ÇOK ÖNEMLİ]\n"
+            "Yazar geçmiş bölümlerde elle değişiklik yaptı. Hikayenin GÜNCEL hali aşağıdaki gibidir; "
+            "eski haliyle çelişme:\n- " + "\n- ".join(edit_notes)
+        )
+
+    if story.chapters:
         parts.append(
             "[GÖREV]\n"
             "Okuyucunun hamlesine göre hikayenin SADECE BİR SONRAKİ BÖLÜMÜNÜ yaz. "
             "Önceki metni tekrar etme, özetleme; kaldığı yerden akıcı şekilde devam et. "
-            "Bilinen evrenle tutarlı kal ama yeni karakterler, mekanlar ve eşyalar icat etmekte tamamen özgürsün."
+            "Özetler ve bilinen evrenle TUTARLI kal; ama sen bir tekrar makinesi değilsin: "
+            "hikayeyi her bölümde İLERİ taşı. Yeni karakterler, mekanlar, olaylar ve eşyalar "
+            "İCAT ETMEKTEN çekinme — icat etmek bu işin kalbidir."
         )
     else:
         parts.append(
@@ -93,14 +152,8 @@ def build_chapter_system_prompt(story: Story, retrieved_block: str | None) -> st
     return "\n\n".join(parts)
 
 
-def build_summary_fold_prompt(previous_summary: str | None) -> str:
-    base = (
-        "Sen usta bir editörsün. Görevin, uzun soluklu bir hikayenin 'koşan özetini' güncel tutmak. "
-        "Sana hikayenin şu ana kadarki özeti ve yeni yazılan son bölüm verilecek. "
-        "İkisini birleştirip GÜNCEL tek bir özet yazacaksın: ana olay örgüsü, karakterlerin son durumu, "
-        "motivasyonları ve çözülmemiş düğümler. En fazla 3 paragraf. "
-        "Cevabına SADECE Türkçe özet metnini yaz, başka hiçbir açıklama ekleme."
-    )
-    if not previous_summary:
-        base += " Önceki özet henüz yok; özeti sıfırdan bu bölümden çıkar."
-    return base
+SINGLE_CHAPTER_SUMMARY_PROMPT = (
+    "Sen usta bir editörsün. Sana bir hikaye bölümü verilecek. Bu bölümde olanları "
+    "EN FAZLA 3 KISA CÜMLEYLE özetle: kim ne yaptı, ne değişti, hangi yeni şey ortaya çıktı. "
+    "Cümlelerini mutlaka tamamla. Cevabına SADECE Türkçe özet metnini yaz, başka hiçbir şey ekleme."
+)

@@ -34,7 +34,11 @@ class Story(Base):
     title: Mapped[str] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(16), default="PENDING")
     initial_prompt: Mapped[str] = mapped_column(Text)
-    running_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Yazarin kalici talimatlari: her bolum uretiminde sisteme enjekte edilir
+    style_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    negative_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Yazar bolum duzenledikten sonra bir SONRAKI uretime tasinacak notlar (JSON listesi)
+    pending_edit_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
@@ -64,6 +68,8 @@ class Chapter(Base):
     story_id: Mapped[int] = mapped_column(ForeignKey("stories.id", ondelete="CASCADE"), index=True)
     index: Mapped[int] = mapped_column("chapter_index", Integer)
     content: Mapped[str] = mapped_column(Text)
+    # Bolumun kendi kisa ozeti; tum ozetler sirayla birlesip hikayenin belini olusturur
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     # deferred: bolum listesi cekilirken 768 float'lik vektorler bosuna yuklenmesin
     embedding = mapped_column(Vector(settings.embedding_dim), nullable=True, deferred=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())

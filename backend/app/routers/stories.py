@@ -10,17 +10,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..ai import client as ai
 from ..database import get_db
 from ..models import Story, User
+from ..ai.prompts import parse_edit_notes
 from ..schemas import (
     ContinueStoryRequest,
     CreateStoryRequest,
     EditChapterRequest,
+    EditChapterSummaryRequest,
     SearchHit,
     SearchWindowChapter,
     StoryDetailResponse,
+    UpdateStorySettingsRequest,
     story_detail,
 )
 from ..security import get_current_user
-from ..services.generation import find_similar_chapters, schedule_generation
+from ..services.generation import find_similar_chapters, schedule_generation, summarize_chapter
 from ..services.sse import broker
 
 logger = logging.getLogger(__name__)
@@ -61,7 +64,14 @@ async def create_story(
     if not title or not prompt:
         raise HTTPException(status_code=400, detail="Başlık ve başlangıç konusu boş olamaz.")
 
-    story = Story(user_id=user.id, title=title, status="PENDING", initial_prompt=prompt)
+    story = Story(
+        user_id=user.id,
+        title=title,
+        status="PENDING",
+        initial_prompt=prompt,
+        style_prompt=(request.style_prompt or "").strip() or None,
+        negative_prompt=(request.negative_prompt or "").strip() or None,
+    )
     db.add(story)
     await db.commit()
     # Yeni eklenen nesnenin iliskileri yuklu degil; async'te lazy-load patladigi icin tazele
@@ -122,6 +132,20 @@ async def delete_story(
     return {"deleted": story_id}
 
 
+@router.put("/{story_id}/settings", response_model=StoryDetailResponse)
+async def update_story_settings(
+    story_id: int,
+    request: UpdateStorySettingsRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    story = await _get_owned_story(story_id, user, db)
+    story.style_prompt = (request.style_prompt or "").strip() or None
+    story.negative_prompt = (request.negative_prompt or "").strip() or None
+    await db.commit()
+    return story_detail(story)
+
+
 @router.put("/{story_id}/chapters/{chapter_index}", response_model=StoryDetailResponse)
 async def edit_chapter(
     story_id: int,
@@ -142,7 +166,9 @@ async def edit_chapter(
     if chapter is None:
         raise HTTPException(status_code=404, detail="Bölüm bulunamadı.")
 
+    old_summary = chapter.summary
     chapter.content = new_content
+
     # Icerik degisti; vektor hafizayi da guncelle (basarisizsa eski vektorle devam etmek
     # yerine None birakiyoruz ki arama yanlis sonuc dondurmesin)
     try:
@@ -151,6 +177,39 @@ async def edit_chapter(
         logger.warning("Duzenlenen bolumun embeddingi guncellenemedi", exc_info=True)
         chapter.embedding = None
 
+    # Ozeti guncel metne gore yeniden cikar (elle ozet ucuyla ayrica duzeltilebilir)
+    try:
+        chapter.summary = await summarize_chapter(new_content) or chapter.summary
+    except Exception:
+        logger.warning("Duzenlenen bolum yeniden ozetlenemedi", exc_info=True)
+
+    # Bir SONRAKI uretime tasinacak not: modele "burada su degisti" diye soyle
+    notes = parse_edit_notes(story.pending_edit_notes)
+    notes.append(
+        f"Bölüm {chapter_index} yazar tarafından değiştirildi. "
+        f"Eski özeti: {old_summary or '(yoktu)'} | Güncel özeti: {chapter.summary or '(özetlenemedi)'}"
+    )
+    story.pending_edit_notes = json.dumps(notes[-5:], ensure_ascii=False)
+
+    await db.commit()
+    story = await db.get(Story, story_id, populate_existing=True)
+    return story_detail(story)
+
+
+@router.put("/{story_id}/chapters/{chapter_index}/summary", response_model=StoryDetailResponse)
+async def edit_chapter_summary(
+    story_id: int,
+    chapter_index: int,
+    request: EditChapterSummaryRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    story = await _get_owned_story(story_id, user, db)
+    chapter = next((c for c in story.chapters if c.index == chapter_index), None)
+    if chapter is None:
+        raise HTTPException(status_code=404, detail="Bölüm bulunamadı.")
+
+    chapter.summary = request.new_summary.strip() or None
     await db.commit()
     story = await db.get(Story, story_id, populate_existing=True)
     return story_detail(story)

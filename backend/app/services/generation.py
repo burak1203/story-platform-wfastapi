@@ -5,7 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..ai import client as ai
-from ..ai.prompts import build_chapter_system_prompt, build_summary_fold_prompt
+from ..ai.prompts import SINGLE_CHAPTER_SUMMARY_PROMPT, build_chapter_system_prompt
 from ..config import settings
 from ..database import SessionLocal
 from ..models import Chapter, Character, Item, Location, Story
@@ -83,6 +83,9 @@ async def _generate_chapter(db: AsyncSession, story_id: int, user_action: str | 
     if not content:
         raise ValueError("Model boş bölüm içeriği döndürdü.")
 
+    # Bolum ozeti ayni cevaptan gelir; modelin yeni yazdigini en iyi yine kendisi ozetler
+    summary = str(parsed.get("chapter_summary") or "").strip()[:2000] or None
+
     embedding = None
     try:
         embedding = await ai.embed(content)
@@ -90,32 +93,45 @@ async def _generate_chapter(db: AsyncSession, story_id: int, user_action: str | 
         logger.warning("Bolum embeddingi hesaplanamadi, vektorsuz kaydediliyor", exc_info=True)
 
     next_index = (story.chapters[-1].index + 1) if story.chapters else 1
-    db.add(Chapter(story_id=story.id, index=next_index, content=content, embedding=embedding))
+    chapter = Chapter(
+        story_id=story.id, index=next_index, content=content, summary=summary, embedding=embedding
+    )
+    db.add(chapter)
     _apply_entities(db, story, parsed)
+    story.pending_edit_notes = None  # duzenleme notlari bu uretimde kullanildi
     story.status = "COMPLETED"
     await db.commit()
 
-    # Bolum hazir: ozeti beklemeden okuyucuya gonder
+    # Bolum hazir: okuyucuya gonder
     story = await db.get(Story, story_id, populate_existing=True)
     if story is None:
         return
     broker.publish(story.id, story_detail(story).model_dump(by_alias=True, mode="json"))
 
-    # Kosan ozeti katla; basarisiz olursa hikayeyi etkilemesin
-    try:
-        summary_system = build_summary_fold_prompt(story.running_summary)
-        summary_user = (
-            f"[ÖNCEKİ ÖZET]\n{story.running_summary or '(henüz yok)'}\n\n[YENİ BÖLÜM]\n{content}"
-        )
-        new_summary = await ai.chat_text(
-            settings.llm_util_model, summary_system, summary_user, temperature=0.4, max_tokens=1024
-        )
-        if new_summary:
-            story.running_summary = new_summary
-            await db.commit()
-            broker.publish(story.id, story_detail(story).model_dump(by_alias=True, mode="json"))
-    except Exception:
-        logger.warning("Kosan ozet guncellenemedi (bolum kaydedildi)", exc_info=True)
+    # Model chapter_summary vermediyse ucuz modelle telafi et
+    if summary is None:
+        try:
+            fallback = await summarize_chapter(content)
+            if fallback:
+                for c in story.chapters:
+                    if c.index == next_index:
+                        c.summary = fallback
+                await db.commit()
+                broker.publish(story.id, story_detail(story).model_dump(by_alias=True, mode="json"))
+        except Exception:
+            logger.warning("Bolum ozeti telafi edilemedi (bolum kaydedildi)", exc_info=True)
+
+
+async def summarize_chapter(content: str) -> str | None:
+    """Tek bolumun 2-3 cumlelik ozeti (uretim disi yollarda da kullanilir: bolum duzenleme)."""
+    text = await ai.chat_text(
+        settings.llm_util_model,
+        SINGLE_CHAPTER_SUMMARY_PROMPT,
+        f"Şu bölümü özetle:\n\n{content[:15000]}",
+        temperature=0.3,
+        max_tokens=512,
+    )
+    return text.strip() or None
 
 
 def _clean_entries(raw, *fields: str) -> list[dict]:
@@ -184,9 +200,10 @@ def _excerpt(text: str) -> str:
 
 
 async def find_similar_chapters(
-    db: AsyncSession, story: Story, query: str, limit: int = 2, exclude_last: bool = True
+    db: AsyncSession, story: Story, query: str, limit: int = 2, exclude_from_index: int | None = None
 ) -> list[tuple[int, float]]:
-    """Sorguya anlamca en yakin bolumleri (index, distance) olarak dondurur."""
+    """Sorguya anlamca en yakin bolumleri (index, distance) olarak dondurur.
+    exclude_from_index verilirse o indeks ve sonrasi aramaya girmez."""
     query_vec = await ai.embed(query)
     stmt = (
         select(Chapter.index, Chapter.embedding.cosine_distance(query_vec).label("dist"))
@@ -194,23 +211,24 @@ async def find_similar_chapters(
         .order_by("dist")
         .limit(limit)
     )
-    if exclude_last and story.chapters:
-        stmt = stmt.where(Chapter.index < story.chapters[-1].index)
+    if exclude_from_index is not None:
+        stmt = stmt.where(Chapter.index < exclude_from_index)
     rows = (await db.execute(stmt)).all()
     return [(row.index, float(row.dist)) for row in rows]
 
 
 async def _retrieve_relevant_block(db: AsyncSession, story: Story, query: str) -> str | None:
     """n-1/n/n+1 penceresi: eslesen bolumlerin komsulariyla birlikte alintisini kurar."""
-    hits = await find_similar_chapters(db, story, query, limit=2, exclude_last=True)
+    # Son iki bolum zaten prompta tam metin olarak giriyor; aramaya dahil etme
+    cutoff = story.chapters[-1].index - 1 if len(story.chapters) >= 2 else story.chapters[-1].index
+    hits = await find_similar_chapters(db, story, query, limit=2, exclude_from_index=cutoff)
     if not hits:
         return None
 
-    last_index = story.chapters[-1].index
     wanted: set[int] = set()
     for index, _ in hits:
         wanted.update({index - 1, index, index + 1})
-    wanted = {i for i in wanted if 1 <= i < last_index}  # son bolum zaten promptta tam olarak var
+    wanted = {i for i in wanted if 1 <= i < cutoff}
 
     chapter_map = {c.index: c for c in story.chapters}
     blocks = [

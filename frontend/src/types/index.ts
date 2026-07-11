@@ -9,7 +9,10 @@ export interface ChapterDto {
   id: number
   index: number
   content: string
+  summary: string | null
 }
+
+export type ElementKind = 'characters' | 'locations' | 'items'
 
 export interface StoryDetailResponse {
   id: number
@@ -18,6 +21,8 @@ export interface StoryDetailResponse {
   status: string
   currentSummary: string | null
   actionCount: number
+  stylePrompt: string | null
+  negativePrompt: string | null
   characters: ElementDto[]
   locations: ElementDto[]
   items: ElementDto[]

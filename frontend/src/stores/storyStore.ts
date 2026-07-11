@@ -1,8 +1,9 @@
 import { defineStore } from 'pinia'
 import axios from 'axios'
-import type { StoryDetailResponse, CreateStoryRequest } from '../types'
+import type { StoryDetailResponse, CreateStoryRequest, ElementKind } from '../types'
 
 const API_URL = 'http://localhost:8000/api/stories'
+const ELEMENTS_URL = 'http://localhost:8000/api/elements'
 
 export const useStoryStore = defineStore('story', {
   state: () => ({
@@ -149,23 +150,97 @@ export const useStoryStore = defineStore('story', {
         this.watchdogTimer = null
       }
     },
-    // Son bölümün metnini düzenler (hikaye artık bölüm bazlı saklanıyor)
-    async editStory(storyId: number, newContent: string) {
-      const lastChapter = this.story?.chapters?.at(-1)
-      if (!lastChapter) return
+    // SSE'yi koparmadan hikayeyi tazeler (varlık/özet düzenlemelerinden sonra)
+    async refreshStory(storyId: number) {
+      try {
+        const response = await axios.get<StoryDetailResponse>(`${API_URL}/${storyId}`)
+        this.story = response.data
+      } catch (err: any) {
+        this.error = err.response?.data?.detail || err.message || 'Hikaye yüklenemedi.'
+      }
+    },
 
+    // Herhangi bir bölümün metnini düzenler; backend özeti ve vektörü yeniler,
+    // bir sonraki üretime "burada şu değişti" notu düşer
+    async editChapter(storyId: number, chapterIndex: number, newContent: string) {
       this.isLoading = true
       this.error = null
       try {
-        const response = await axios.put(
-          `${API_URL}/${storyId}/chapters/${lastChapter.index}`,
-          { newContent },
-        )
+        const response = await axios.put(`${API_URL}/${storyId}/chapters/${chapterIndex}`, {
+          newContent,
+        })
         this.story = response.data
       } catch (err: any) {
         this.error = err.response?.data?.detail || err.message || 'Bölüm güncellenemedi.'
+        throw err
       } finally {
         this.isLoading = false
+      }
+    },
+
+    async editChapterSummary(storyId: number, chapterIndex: number, newSummary: string) {
+      this.error = null
+      try {
+        const response = await axios.put(
+          `${API_URL}/${storyId}/chapters/${chapterIndex}/summary`,
+          { newSummary },
+        )
+        this.story = response.data
+      } catch (err: any) {
+        this.error = err.response?.data?.detail || err.message || 'Özet güncellenemedi.'
+        throw err
+      }
+    },
+
+    async updateSettings(storyId: number, stylePrompt: string, negativePrompt: string) {
+      this.error = null
+      try {
+        const response = await axios.put(`${API_URL}/${storyId}/settings`, {
+          stylePrompt,
+          negativePrompt,
+        })
+        this.story = response.data
+      } catch (err: any) {
+        this.error = err.response?.data?.detail || err.message || 'Ayarlar kaydedilemedi.'
+        throw err
+      }
+    },
+
+    async addElement(kind: ElementKind, storyId: number, name: string, description: string) {
+      this.error = null
+      try {
+        await axios.post(`${ELEMENTS_URL}/${kind}`, { storyId, name, description })
+        await this.refreshStory(storyId)
+      } catch (err: any) {
+        this.error = err.response?.data?.detail || err.message || 'Öğe eklenemedi.'
+        throw err
+      }
+    },
+
+    async updateElement(
+      kind: ElementKind,
+      storyId: number,
+      elementId: number,
+      name: string,
+      description: string,
+    ) {
+      this.error = null
+      try {
+        await axios.put(`${ELEMENTS_URL}/${kind}/${elementId}`, { name, description })
+        await this.refreshStory(storyId)
+      } catch (err: any) {
+        this.error = err.response?.data?.detail || err.message || 'Öğe güncellenemedi.'
+        throw err
+      }
+    },
+
+    async deleteElement(kind: ElementKind, storyId: number, elementId: number) {
+      this.error = null
+      try {
+        await axios.delete(`${ELEMENTS_URL}/${kind}/${elementId}`)
+        await this.refreshStory(storyId)
+      } catch (err: any) {
+        this.error = err.response?.data?.detail || err.message || 'Öğe silinemedi.'
       }
     },
   },

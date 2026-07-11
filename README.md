@@ -24,11 +24,12 @@ Eski çoklu-servis yapı (Spring Boot + Kafka + ayrı Python worker) tek bir Fas
 
 ## Hafıza Yaşam Döngüsü
 
-1. **Bölüm üretimi:** Model her bölümü tek JSON'da döner: bölüm metni + `new_characters` / `updated_characters` / `new_locations` / `new_items`.
-2. **Varlık hafızası (lorebook):** Varlıklar hikaye bazında isimle **upsert** edilir; kopya oluşmaz. Bilinen karakterlerin durum değişimleri (`status_change`) karakter kartına işlenir.
-3. **Koşan özet:** Her bölümden sonra ucuz modelle mevcut özet + yeni bölüm katlanarak güncel tutulur.
+1. **Bölüm üretimi:** Model her bölümü tek JSON'da döner: bölüm metni + **bölüm özeti** + `new_characters` / `updated_characters` / `new_locations` / `new_items`.
+2. **Varlık hafızası (lorebook):** Varlıklar hikaye bazında isimle **upsert** edilir; kopya oluşmaz. Bilinen karakterlerin durum değişimleri (`status_change`) karakter kartına işlenir. Studio'dan elle eklenebilir/düzenlenebilir/silinebilir.
+3. **Bölüm özetleri:** Her bölümün kendi kısa özeti vardır; hepsi kronolojik sırayla birleşip hikayenin omurgasını oluşturur. Özetler elle de düzenlenebilir.
 4. **Vektör hafıza:** Her bölüm `gemini-embedding-001` ile (768 boyut) ayrı ayrı vektörlenir ve pgvector'de saklanır.
-5. **Sonraki bölümün bağlamı:** koşan özet + son bölümün tam metni + varlık kartları + (3+ bölümden sonra) kullanıcı hamlesiyle anlamca eşleşen geçmiş bölümlerin **n-1/n/n+1 penceresi**.
+5. **Sonraki bölümün bağlamı:** yazarın kalıcı talimatı + negatif talimat + tüm bölüm özetleri (sıralı, tavanlı) + **son iki bölümün tam metni** + varlık kartları + hamleyle anlamca eşleşen eski bölümlerin **n-1/n/n+1 penceresi** + varsa "yazar şu bölümü değiştirdi" notları.
+6. **Düzenleme akışı:** Her bölüm Studio'dan düzenlenebilir; kaydedilince bölüm yeniden özetlenir, vektörü yenilenir ve bir sonraki üretime "burada şu değişti" notu taşınır.
 
 ## Yerel Kurulum
 
