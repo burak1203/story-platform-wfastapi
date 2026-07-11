@@ -2,7 +2,7 @@ import { defineStore } from 'pinia'
 import axios from 'axios'
 import type { StoryDetailResponse, CreateStoryRequest } from '../types'
 
-const API_URL = 'http://localhost:8080/api/stories'
+const API_URL = 'http://localhost:8000/api/stories'
 
 export const useStoryStore = defineStore('story', {
   state: () => ({
@@ -53,7 +53,7 @@ export const useStoryStore = defineStore('story', {
         this.connectToStream(storyId)
 
         // butonları kilitli tut ve Watchdog'u başlat.
-        if (this.story.status === 'PENDING') {
+        if (this.story.status === 'PENDING' || this.story.status === 'GENERATING') {
           this.isLoading = true
           this.startWatchdog()
         } else {
@@ -149,14 +149,21 @@ export const useStoryStore = defineStore('story', {
         this.watchdogTimer = null
       }
     },
+    // Son bölümün metnini düzenler (hikaye artık bölüm bazlı saklanıyor)
     async editStory(storyId: number, newContent: string) {
+      const lastChapter = this.story?.chapters?.at(-1)
+      if (!lastChapter) return
+
       this.isLoading = true
       this.error = null
       try {
-        const response = await axios.put(`${API_URL}/${storyId}/content`, { newContent })
+        const response = await axios.put(
+          `${API_URL}/${storyId}/chapters/${lastChapter.index}`,
+          { newContent },
+        )
         this.story = response.data
       } catch (err: any) {
-        this.error = err.message || 'Hikaye güncellenemedi.'
+        this.error = err.response?.data?.detail || err.message || 'Bölüm güncellenemedi.'
       } finally {
         this.isLoading = false
       }

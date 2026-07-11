@@ -2,6 +2,13 @@ export interface ElementDto {
   id: number
   name: string
   description: string
+  status?: string | null
+}
+
+export interface ChapterDto {
+  id: number
+  index: number
+  content: string
 }
 
 export interface StoryDetailResponse {
@@ -14,6 +21,7 @@ export interface StoryDetailResponse {
   characters: ElementDto[]
   locations: ElementDto[]
   items: ElementDto[]
+  chapters: ChapterDto[]
 }
 
 export interface RegisterRequest {

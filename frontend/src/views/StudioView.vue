@@ -46,10 +46,10 @@ const submitAction = async () => {
   // URL'deki doğru ID'ye hamleyi gönderiyoruz
   await store.continueStory(storyId.value, actionText)
 }
-// Düzenleme modunu aç/kapat
+// Düzenleme modunu aç/kapat (hikaye bölüm bazlı: sadece son bölüm düzenlenir)
 const toggleEdit = () => {
   if (!isEditing.value) {
-    editableContent.value = store.story?.content || ''
+    editableContent.value = store.story?.chapters?.at(-1)?.content || ''
   }
   isEditing.value = !isEditing.value
 }
@@ -104,7 +104,7 @@ const saveEdit = async () => {
           @click="toggleEdit"
           class="text-sm bg-slate-800 hover:bg-slate-700 text-amber-500 px-4 py-2 rounded border border-slate-700 transition-colors"
         >
-          {{ isEditing ? 'İptal' : 'Hikayeyi Düzenle' }}
+          {{ isEditing ? 'İptal' : 'Son Bölümü Düzenle' }}
         </button>
       </div>
 

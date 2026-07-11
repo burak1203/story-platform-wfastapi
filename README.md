@@ -1,86 +1,78 @@
-# StoryPlatform - AI-Powered Epistolary & Interactive Fiction Engine
+# StoryPlatform — Bölüm Hafızalı İnteraktif Hikaye Motoru
 
-StoryPlatform is a modern, microservice-based interactive storytelling and RPG engine designed to eliminate the classic LLM context-window limitation. By leveraging a Hybrid RAG (Retrieval-Augmented Generation) architecture, Relational Database Entity Extraction, and an Autonomous Running Summary loop, the system maintains a persistent, infinite-horizon memory of stories, characters, locations, and items.
+StoryPlatform, uzun soluklu yapay zeka destekli hikayelerde yaşanan **context window (bağlam penceresi) problemini** çözmek için tasarlanmış interaktif bir hikaye/RPG motorudur. İlham kaynağı SillyTavern'dir.
 
-## System Architecture
+Temel fikir: hikayenin tamamını her seferinde modele göndermek yerine, her bölüm yazıldığında **parçalanır** (karakterler, mekanlar, eşyalar, özet) ve hafızaya atılır. Sonraki bölüm yazdırılırken modele yalnızca **damıtılmış bağlam** verilir. Böylece hikaye kaç bölüme ulaşırsa ulaşsın prompt boyutu sabit kalır ve model bağlamdan kopmaz.
 
-The project is built as a **Monorepo** comprising two decoupled services communicating asynchronously via **Apache Kafka** and synchronously via **REST APIs**:
+## Mimari
+
+Eski çoklu-servis yapı (Spring Boot + Kafka + ayrı Python worker) tek bir FastAPI servisinde birleştirildi:
 
 ```
-[ Frontend (React / Vue) ]
-           │
-           ▼ (REST API)
-[ Core API (Java / Spring Boot 3.x) ] <───> [ PostgreSQL + pgvector ]
-           │                                      ▲
-           ▼ (Apache Kafka)                       │
-[ AI Worker (Python 3.12 / FastAPI) ] ────────────┘ (Vector Embeddings & Summary Call)
+[ Frontend (Vue 3 + Vite) :5173 ]
+            │  REST + SSE
+            ▼
+[ Backend (Python 3.11+ / FastAPI) :8000 ]
+            │
+            ├── PostgreSQL + pgvector  (hikayeler, bölümler, varlıklar, vektörler)
+            └── Gemini API (OpenAI SDK uyumlu endpoint üzerinden)
 ```
 
-1. **Core API (Java / Spring Boot 3.x):** The system's backbone. Manages users, core transactional story entities, relational mapping, database updates, and orchestrates the event-driven workflow.
-2. **AI Worker (Python 3.12 / FastAPI):** The computational brain. Handles asynchronous long-form text generation using state-of-the-art Large Language Models (LLMs) via OpenRouter/HuggingFace and real-time synchronous embedding generation.
+- Bölüm üretimi **asyncio arka plan görevlerinde** çalışır; sonuç **SSE** ile tarayıcıya anında iletilir (Kafka kaldırıldı — bu ölçekte gereksizdi).
+- Aynı hikaye için eş zamanlı iki üretim, atomik durum geçişi + hikaye bazlı kilitle engellenir (ikinci istek `409` alır).
+- LLM erişimi **OpenAI SDK** ile yapılır; `.env`'deki `LLM_BASE_URL` / `LLM_API_KEY` / model adları değiştirilerek sağlayıcı tek satırla değiştirilebilir.
 
-## Key Features & AI Memory Lifecycle
+## Hafıza Yaşam Döngüsü
 
-### 1. Asynchronous Story Generation Loop
-To maximize throughput and decouple I/O heavy LLM processing times from the web server, story requests are pushed to an Apache Kafka pipeline (`story-tasks-topic`). The Core API frees the user immediately with a `PENDING` status. The AI Worker processes the queue and replies to `story-completed-topic` when the generation finishes.
+1. **Bölüm üretimi:** Model her bölümü tek JSON'da döner: bölüm metni + `new_characters` / `updated_characters` / `new_locations` / `new_items`.
+2. **Varlık hafızası (lorebook):** Varlıklar hikaye bazında isimle **upsert** edilir; kopya oluşmaz. Bilinen karakterlerin durum değişimleri (`status_change`) karakter kartına işlenir.
+3. **Koşan özet:** Her bölümden sonra ucuz modelle mevcut özet + yeni bölüm katlanarak güncel tutulur.
+4. **Vektör hafıza:** Her bölüm `gemini-embedding-001` ile (768 boyut) ayrı ayrı vektörlenir ve pgvector'de saklanır.
+5. **Sonraki bölümün bağlamı:** koşan özet + son bölümün tam metni + varlık kartları + (3+ bölümden sonra) kullanıcı hamlesiyle anlamca eşleşen geçmiş bölümlerin **n-1/n/n+1 penceresi**.
 
-### 2. Information Extraction & Relational Mapping (Human-in-the-Loop)
-Instead of storing massive unformatted strings, the Python Worker enforces a **Structured JSON Output** layout on the LLM. It extracts key story elements on-the-fly:
-* **Characters:** Names and short biographical data.
-* **Locations:** Biomes, environments, or rooms introduced.
-* **Items:** Key objects, weapons, or plot devices discovered.
+## Yerel Kurulum
 
-The Core API parses this payload and distributes it across highly indexed relational tables (`characters`, `locations`, `items`) linked to the main `stories` table via dual Many-to-One constraints.
-
-### 3. Infinite Memory via Hybrid RAG & pgvector
-To resolve the amnesia (context-window wipe) common in long-running creative prompts:
-* **Vector Database Storage:** Generated text blocks are embedded locally into a 384-dimensional space via Hugging Face's `all-MiniLM-L6-v2` transformer model and saved inside PostgreSQL using the **pgvector** extension.
-* **Semantic Search:** Users can execute meaning-based queries across their historical lore. The Core API queries pgvector using **Cosine Distance (`<=>`)** to inject relevant past context directly back into the LLM's prompt window.
-
-### 4. Autonomous Running Summary Engine
-To prevent token-bloat as the story passes chapter 50+, the system utilizes an internal counter. Every 3 user interactions, an asynchronous background task (`SUMMARIZE_STORY`) evaluates the entire narrative chunk and compresses it into a running plot summary stored in the database, acting as a low-frequency long-term memory layer.
-
-## 🛠️ Tech Stack
-
-* **Backend Core:** Java 21, Spring Boot 3, Spring Data JPA, Hibernate 6
-* **AI & API Middleware:** Python 3.12, FastAPI, Uvicorn, OpenAI SDK, SentenceTransformers (Hugging Face)
-* **Message Broker:** Apache Kafka (KRaft mode)
-* **Databases & Cache:** PostgreSQL 15+ (with `pgvector` extension), Redis 7 (Rate Limiting)
-* **Project Management:** GitHub Projects (Kanban methodology)
-
-## 🚀 Local Setup
-
-### 1. Infrastructure
-Spin up the core database, messaging, and caching instances via Docker:
+### 1. Veritabanı
 ```bash
 docker-compose up -d
 ```
+> **Not:** Eski (Spring Boot'lu) sürümü çalıştırdıysan tablo şemaları uyumsuzdur; veritabanını bir kez sıfırla: `docker-compose down -v && docker-compose up -d`
 
-### 2. Core API Setup
-1. Open the `core-api` directory in your IDE as a Maven project.
-2. Ensure your local JDK is set to version 21.
-3. Configure your environmental variables or update `src/main/resources/application.yml` with your local PostgreSQL and Kafka credentials.
-4. Run the `CoreApiApplication.java` entry point.
-
-### 3. AI Worker Setup
-1. Set up the isolated virtual environment and install the pinned dependencies:
+### 2. Backend
 ```bash
-cd ai-worker
+cd backend
 python -m venv venv
-
-# On Windows:
-.\venv\Scripts\activate
-
-# On macOS/Linux:
-source venv/bin/activate
-
+source venv/bin/activate        # Windows: .\venv\Scripts\activate
 pip install -r requirements.txt
+
+cp .env.example .env            # LLM_API_KEY'e Gemini anahtarını yaz
+
+uvicorn app.main:app --reload --port 8000
 ```
-2. Create a .env file in the ai-worker directory and add your OpenRouter API key
+Tablolar ilk açılışta otomatik oluşturulur (`CREATE EXTENSION vector` dahil).
+
+### 3. Frontend
 ```bash
-OPENROUTER_API_KEY=your_api_key_here
+cd frontend
+npm install
+npm run dev                     # http://localhost:5173
 ```
-3. Run the application
-```bash
-uvicorn main:app --reload --port 8000
-```
+
+## API Özeti
+
+| Uç | Açıklama |
+|---|---|
+| `POST /api/auth/register`, `/authenticate` | JWT tabanlı kayıt/giriş |
+| `GET/POST /api/stories`, `GET /api/stories/my-stories` | Hikaye oluşturma/listeleme |
+| `POST /api/stories/{id}/continue` | Yeni bölüm üretimini başlatır (async) |
+| `GET /api/stories/{id}/stream` | SSE: üretim bitince canlı güncelleme |
+| `PUT /api/stories/{id}/chapters/{index}` | Bölüm metnini düzenle (vektör de yenilenir) |
+| `GET /api/stories/{id}/search?query=` | Bölümler üzerinde semantik arama (n±1 pencereli) |
+| `PUT/DELETE /api/elements/{kind}/{id}` | Karakter/mekan/eşya düzenleme-silme |
+
+## Yol Haritası
+
+- [ ] Arayüzün bölüm bazlı görünüme taşınması (bölüm listesi, geçmiş bölüm düzenleme)
+- [ ] Arama penceresinin devam promptuna kullanıcı kontrolünde enjeksiyonu
+- [ ] Alembic migration altyapısı
+- [ ] Yayınlama platformu (Wattpad benzeri keşfet/okuma akışı)

@@ -162,8 +162,9 @@ const handleDelete = async (id: number) => {
             >Durum:
             <span
               :class="{
-                'text-amber-500': story.status === 'PENDING',
+                'text-amber-500': story.status === 'PENDING' || story.status === 'GENERATING',
                 'text-emerald-500': story.status === 'COMPLETED',
+                'text-red-500': story.status === 'FAILED',
               }"
               >{{ story.status }}</span
             ></span
