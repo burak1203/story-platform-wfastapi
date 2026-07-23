@@ -1,10 +1,15 @@
+import asyncio
+import logging
 from collections.abc import AsyncGenerator
+from pathlib import Path
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
 from .config import settings
+
+logger = logging.getLogger(__name__)
 
 engine = create_async_engine(settings.database_url, pool_pre_ping=True)
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
@@ -14,24 +19,39 @@ class Base(DeclarativeBase):
     pass
 
 
-# create_all mevcut tablolara yeni kolon EKLEMEZ; kucuk sema degisiklikleri icin
-# elle migration listesi (Alembic gelene kadar yeterli)
-_MIGRATIONS = (
-    "ALTER TABLE stories ADD COLUMN IF NOT EXISTS style_prompt TEXT",
-    "ALTER TABLE stories ADD COLUMN IF NOT EXISTS negative_prompt TEXT",
-    "ALTER TABLE stories ADD COLUMN IF NOT EXISTS pending_edit_notes TEXT",
-    "ALTER TABLE chapters ADD COLUMN IF NOT EXISTS summary TEXT",
+# Sema Alembic ile yonetilir. Auto-create/ALTER blocklari KALDIRILDI: acilista
+# "alembic upgrade head" calisir (bos prod DB tablolari kurar, mevcut DB baseline'dan
+# ileri migration'lari uygular). alembic.ini bu dosyanin iki ust dizininde (backend/).
+_ALEMBIC_INI = Path(__file__).resolve().parent.parent / "alembic.ini"
+
+# Uygulama uretim ortasinda kapanirsa hikayeler PENDING/GENERATING'de takili kalir
+# ve sonsuza dek 409 doner; acilista toparla (uretim gorevleri process'le birlikte olur,
+# bu yuzden acilista "busy" hikaye olamaz): bolumu olmayan FAILED, digerleri COMPLETED.
+_RECOVER_STUCK_STATUSES = (
+    "UPDATE stories SET status = 'FAILED' WHERE status IN ('PENDING', 'GENERATING') "
+    "AND NOT EXISTS (SELECT 1 FROM chapters WHERE chapters.story_id = stories.id)",
+    "UPDATE stories SET status = 'COMPLETED' WHERE status IN ('PENDING', 'GENERATING')",
 )
 
 
-async def init_db() -> None:
-    from . import models  # noqa: F401 - tablolarin metadata'ya kaydolmasi icin
+def _run_upgrade() -> None:
+    """alembic upgrade head — senkron. to_thread icinden cagrilir: async env.py online
+    modda kendi asyncio.run'ini kullaniyor, calisan event loop icinden dogrudan cagrilamaz."""
+    from alembic import command
+    from alembic.config import Config
 
+    cfg = Config(str(_ALEMBIC_INI))
+    cfg.set_main_option("script_location", str(_ALEMBIC_INI.parent / "alembic"))
+    command.upgrade(cfg, "head")
+
+
+async def init_db() -> None:
+    # Semayi guncel migration'a getir (auto-create YOK)
+    await asyncio.to_thread(_run_upgrade)
+    # Runtime toparlama: acilistaki takili uretim durumlarini duzelt
     async with engine.begin() as conn:
-        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-        await conn.run_sync(Base.metadata.create_all)
-        for migration in _MIGRATIONS:
-            await conn.execute(text(migration))
+        for statement in _RECOVER_STUCK_STATUSES:
+            await conn.execute(text(statement))
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:

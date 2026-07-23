@@ -9,4 +9,8 @@ pydantic-settings>=2.3
 PyJWT>=2.8
 bcrypt>=4.1
 json-repair>=0.30
+google-auth>=2.30
+requests>=2.32
+slowapi>=0.1.9
+alembic>=1.13
 
