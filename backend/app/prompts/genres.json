@@ -1,0 +1,22 @@
+{
+  "thriller": {
+    "en": "Genre — thriller: sustain tension and forward momentum; keep the reader uncertain about what comes next. Favor short propulsive beats, concrete stakes, and a ticking sense of danger.",
+    "tr": ""
+  },
+  "hurt_comfort": {
+    "en": "Genre — hurt/comfort: center emotional vulnerability and care. Move between pain (physical or emotional) and the relief of being comforted; prioritize tenderness, aftercare, and earned intimacy.",
+    "tr": ""
+  },
+  "crack": {
+    "en": "Genre — crack: lean into absurd, comedic, self-aware chaos. Escalate ridiculous premises with confident internal logic; prioritize humor over realism while keeping characters recognizable.",
+    "tr": ""
+  },
+  "fix_it": {
+    "en": "Genre — fix-it: rewrite events so a prior tragedy or bad outcome is averted or repaired. Give characters the agency and second chances they were denied; steer toward healing and better endings.",
+    "tr": ""
+  },
+  "psychological": {
+    "en": "Genre — psychological: foreground interiority, unreliable perception, and the slow pressure of the mind. Favor mood, ambiguity, and the gap between what characters feel and what is real.",
+    "tr": ""
+  }
+}
