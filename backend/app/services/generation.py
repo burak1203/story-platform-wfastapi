@@ -1,14 +1,22 @@
 import asyncio
 import logging
 
-from sqlalchemy import select
+from openai import RateLimitError
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..ai import client as ai
-from ..ai.prompts import SINGLE_CHAPTER_SUMMARY_PROMPT, build_chapter_system_prompt
-from ..config import settings
+from ..ai import embeddings
+from ..ai.client import LlmCtx, LlmKeyInvalid
+from ..ai.prompts import (
+    ENTITY_EXTRACTION_PROMPT,
+    EVENT_TEXT_CAP,
+    MAX_EVENTS_PER_CHAPTER,
+    SINGLE_CHAPTER_SUMMARY_PROMPT,
+    build_chapter_system_prompt,
+)
 from ..database import SessionLocal
-from ..models import Chapter, Character, Item, Location, Story
+from ..models import Chapter, Character, Event, Item, Location, Story
 from ..schemas import story_detail
 from .sse import broker
 
@@ -16,33 +24,67 @@ logger = logging.getLogger(__name__)
 
 # Ayni hikaye icin ayni anda iki uretim calismasin diye hikaye bazli kilit.
 # API katmanindaki atomik status guncellemesi ikinci savunma hattidir.
+# _lock_refcount: her kilidi kac gorev tutuyor/bekliyor; sifira duserse kilit dict'ten
+# ayiklanir (uzun omurlu serviste binlerce hikaye icin kilit sizmasin). Tek asyncio
+# thread'inde setdefault+increment ve decrement+pop arasinda await olmadigi icin guvenli.
 _story_locks: dict[int, asyncio.Lock] = {}
+_lock_refcount: dict[int, int] = {}
 _background_tasks: set[asyncio.Task] = set()
 
 RETRIEVAL_MIN_CHAPTERS = 3  # bu kadar bolum birikmeden gecmis aramasi yapmaya gerek yok
 EXCERPT_CHARS = 1200
+EVENT_EMBED_BATCH = 128     # telafide tek seferde embedlenecek azami NULL olay sayisi
+EVENT_RETRIEVAL_LIMIT = 4   # sorguya en yakin kac olay cekilsin (chapter'a indirgenir)
+
+# Dinamik onem: RAG'le cekilen olayin importance'i AZALAN artisla yukselir, CEIL'i asmaz.
+# Formul: new = old + (CEIL - old) * GROWTH  -> her cekilis daha az ekler, hicbir sey 1.0'a
+# kosmaz; boylece "cok onemli" ile digerleri arasindaki ayrim korunur.
+IMPORTANCE_CEIL = 0.95
+IMPORTANCE_GROWTH = 0.2
+
+# Lazy backfill (olay sisteminden onceki bolumler): her uretimde EN FAZLA bu kadar eski
+# bolum islenir (kullanici yeni bolum uretirken 50 bolumluk backfill beklemesin), en yeni
+# event'siz bolumden geriye dogru. Bir bolum ust uste basarisiz olursa MAX'a ulasinca artik
+# denenmez (kullanicinin parasi bosuna yanmasin).
+BACKFILL_PER_RUN = 3
+MAX_BACKFILL_ATTEMPTS = 3
 
 
-def schedule_generation(story_id: int, user_action: str | None) -> None:
-    """Bolum uretimini arka plana atar; endpoint aninda doner, sonuc SSE ile iletilir."""
-    task = asyncio.create_task(_run_generation(story_id, user_action))
+def schedule_generation(story_id: int, user_action: str | None, ctx: LlmCtx) -> None:
+    """Bolum uretimini arka plana atar; endpoint aninda doner, sonuc SSE ile iletilir.
+    Kullanicinin anahtari (ctx) yalnizca bu goreve arguman olarak tasinir."""
+    task = asyncio.create_task(_run_generation(story_id, user_action, ctx))
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
 
 
-async def _run_generation(story_id: int, user_action: str | None) -> None:
+async def _run_generation(story_id: int, user_action: str | None, ctx: LlmCtx) -> None:
     lock = _story_locks.setdefault(story_id, asyncio.Lock())
-    async with lock:
-        try:
-            async with SessionLocal() as db:
-                await _generate_chapter(db, story_id, user_action)
-        except Exception as exc:
-            logger.exception("Hikaye %s icin bolum uretimi basarisiz oldu", story_id)
-            await _recover_status(story_id)
-            broker.publish(
-                story_id,
-                {"type": "AI_ERROR", "message": f"Yapay zeka bölümü üretemedi: {str(exc)[:200]}"},
-            )
+    _lock_refcount[story_id] = _lock_refcount.get(story_id, 0) + 1  # await'siz: atomik
+    try:
+        async with lock:
+            try:
+                async with SessionLocal() as db:
+                    await _generate_chapter(db, story_id, user_action, ctx)
+            except Exception as exc:
+                # Saglayicinin ham hatasi kullaniciya gosterilmez (anahtar/detay sizdirmamak icin)
+                if isinstance(exc, LlmKeyInvalid):
+                    logger.warning("Hikaye %s: kullanicinin LLM anahtari reddedildi", story_id)
+                    message = "API anahtarın sağlayıcı tarafından reddedildi. Ayarlar'dan anahtarını kontrol et."
+                elif isinstance(exc, RateLimitError):
+                    logger.warning("Hikaye %s: saglayici kota/hiz siniri", story_id)
+                    message = "Sağlayıcının kota veya hız sınırına takıldın. Biraz bekleyip tekrar dene."
+                else:
+                    logger.exception("Hikaye %s icin bolum uretimi basarisiz oldu", story_id)
+                    message = "Yapay zeka bölümü üretemedi. Lütfen tekrar dene."
+                await _recover_status(story_id)
+                broker.publish(story_id, {"type": "AI_ERROR", "message": message})
+    finally:
+        # Bu kilidi tutan/bekleyen kimse kalmadiysa dict'ten ayikla (await'siz: atomik)
+        _lock_refcount[story_id] -= 1
+        if _lock_refcount[story_id] <= 0:
+            _lock_refcount.pop(story_id, None)
+            _story_locks.pop(story_id, None)
 
 
 async def _recover_status(story_id: int) -> None:
@@ -59,10 +101,12 @@ async def _recover_status(story_id: int) -> None:
         logger.exception("Hikaye %s statusu kurtarilamadi", story_id)
 
 
-async def _generate_chapter(db: AsyncSession, story_id: int, user_action: str | None) -> None:
+async def _generate_chapter(db: AsyncSession, story_id: int, user_action: str | None, ctx: LlmCtx) -> None:
     story = await db.get(Story, story_id)
     if story is None:  # uretim beklerken hikaye silinmis
         return
+
+    await _repair_missing_derivatives(db, story, ctx)
 
     is_first = len(story.chapters) == 0
 
@@ -74,11 +118,12 @@ async def _generate_chapter(db: AsyncSession, story_id: int, user_action: str | 
             logger.warning("Gecmis bolum aramasi atlandi", exc_info=True)
 
     system_prompt = build_chapter_system_prompt(story, retrieved_block)
+    # Kullanicinin hamlesi USER mesajinda (cache-dostu: sistem promptu sabit prefix, hamle degisken)
     user_message = (
-        f"Hikaye Konusu: {story.initial_prompt}" if is_first else f"Hamlem: {user_action}"
+        f"Story topic: {story.initial_prompt}" if is_first else f"Reader's move: {user_action}"
     )
 
-    parsed = await ai.chat_json(settings.llm_story_model, system_prompt, user_message, temperature=0.8)
+    parsed = await ai.chat_json(ctx, ctx.story_model, system_prompt, user_message, temperature=0.8)
     content = str(parsed.get("content") or "").strip()
     if not content:
         raise ValueError("Model boş bölüm içeriği döndürdü.")
@@ -86,18 +131,15 @@ async def _generate_chapter(db: AsyncSession, story_id: int, user_action: str | 
     # Bolum ozeti ayni cevaptan gelir; modelin yeni yazdigini en iyi yine kendisi ozetler
     summary = str(parsed.get("chapter_summary") or "").strip()[:2000] or None
 
-    embedding = None
-    try:
-        embedding = await ai.embed(content)
-    except Exception:
-        logger.warning("Bolum embeddingi hesaplanamadi, vektorsuz kaydediliyor", exc_info=True)
-
+    # NOT: chapters.embedding artik YAZILMAZ. Retrieval olay-embed'e (OpenAI uzayi) tasindi;
+    # eski kolon GEMINI uzayindadir, dokunulmaz (yeni bolumlerde NULL kalir, sorgulanmaz).
     next_index = (story.chapters[-1].index + 1) if story.chapters else 1
-    chapter = Chapter(
-        story_id=story.id, index=next_index, content=content, summary=summary, embedding=embedding
-    )
+    chapter = Chapter(story_id=story.id, index=next_index, content=content, summary=summary)
     db.add(chapter)
+    await db.flush()  # olaylarin FK'si icin chapter.id gerekiyor
     _apply_entities(db, story, parsed)
+    created_events = _apply_events(db, story.id, chapter.id, parsed)
+    await _embed_events(db, story.user_id, created_events)  # tek batch; patlarsa NULL kalir
     story.pending_edit_notes = None  # duzenleme notlari bu uretimde kullanildi
     story.status = "COMPLETED"
     await db.commit()
@@ -111,7 +153,7 @@ async def _generate_chapter(db: AsyncSession, story_id: int, user_action: str | 
     # Model chapter_summary vermediyse ucuz modelle telafi et
     if summary is None:
         try:
-            fallback = await summarize_chapter(content)
+            fallback = await summarize_chapter(ctx, content)
             if fallback:
                 for c in story.chapters:
                     if c.index == next_index:
@@ -121,17 +163,131 @@ async def _generate_chapter(db: AsyncSession, story_id: int, user_action: str | 
         except Exception:
             logger.warning("Bolum ozeti telafi edilemedi (bolum kaydedildi)", exc_info=True)
 
+    # Lazy backfill EN SON: bolum kullaniciya zaten gonderildi. Bounded + izole; patlarsa
+    # uretim sonucu etkilenmez (asla _run_generation'a exception SIZDIRMA, yoksa basarili
+    # uretim yanlislikla AI_ERROR olarak isaretlenir).
+    try:
+        await _backfill_events(db, story, ctx)
+    except Exception:
+        logger.warning("Olay backfill'i atlandi (uretim etkilenmedi)", exc_info=True)
 
-async def summarize_chapter(content: str) -> str | None:
+
+async def _repair_missing_derivatives(db: AsyncSession, story: Story, ctx: LlmCtx) -> None:
+    """Onceki calismalarda uretilememis bolum ozetlerini + embedding'i NULL kalan olaylari
+    tamamlar (idempotent: her uretimde eksikler yeniden denenir). C2'den kalan veya yazim
+    aninda embedlenememis olaylar burada doldurulur. Basarisizlik uretimi engellemez.
+    NOT: chapters.embedding'e DOKUNULMAZ (Gemini uzayi; retrieval artik olay-embed'de)."""
+    try:
+        for chapter in story.chapters:
+            if chapter.summary is None:
+                chapter.summary = await summarize_chapter(ctx, chapter.content)
+
+        # embedding'i NULL kalan olaylari bul ve TEK batch cagriyla doldur (bounded)
+        pending = (
+            (
+                await db.execute(
+                    select(Event)
+                    .where(Event.story_id == story.id, Event.embedding.is_(None))
+                    .limit(EVENT_EMBED_BATCH)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        await _embed_events(db, story.user_id, pending)
+    except embeddings.EmbedQuotaExceeded:
+        logger.warning("Kullanici %s embed kotasi doldu; telafi ertelendi", story.user_id)
+    except Exception:
+        logger.warning("Eksik ozet/olay-embed telafisi yarim kaldi", exc_info=True)
+    finally:
+        # Uretimin kendisi patlarsa bile tamamlanan telafiler kaybolmasin
+        await db.commit()
+
+
+async def summarize_chapter(ctx: LlmCtx, content: str) -> str | None:
     """Tek bolumun 2-3 cumlelik ozeti (uretim disi yollarda da kullanilir: bolum duzenleme)."""
     text = await ai.chat_text(
-        settings.llm_util_model,
+        ctx,
+        ctx.util_model,
         SINGLE_CHAPTER_SUMMARY_PROMPT,
-        f"Şu bölümü özetle:\n\n{content[:15000]}",
+        f"Chapter to summarize:\n\n{content[:15000]}",
         temperature=0.3,
         max_tokens=512,
+        reasoning=False,  # util isi: reasoning gereksiz + output olarak faturalanir
     )
     return text.strip() or None
+
+
+async def apply_new_entities_from_edit(
+    db: AsyncSession, story: Story, chapter_id: int, content: str, ctx: LlmCtx
+) -> None:
+    """Bolum DUZENLENDIGINDE cagrilir: duzenlenen metinden varliklari VE olaylari cikarir,
+    YALNIZCA yeni girenleri ekler. Silme/hayalet-temizleme yok, mevcut varliklarin durumu
+    degistirilmez (include_updates=False); olaylar da yalnizca eklenir (embedding'i C3 doldurur).
+    Ana uretimde entity/olaylar uretim JSON'undan geldigi icin bu yol yalnizca duzenleme icindir."""
+    parsed = await ai.chat_json(
+        ctx,
+        ctx.util_model,
+        ENTITY_EXTRACTION_PROMPT,
+        f"Chapter to process:\n\n{content[:15000]}",
+        temperature=0.2,
+        max_tokens=2048,
+        reasoning=False,  # util isi: reasoning gereksiz + output olarak faturalanir
+    )
+    _apply_entities(db, story, parsed, include_updates=False)
+    created_events = _apply_events(db, story.id, chapter_id, parsed)
+    await _embed_events(db, story.user_id, created_events)
+
+
+async def _backfill_events(db: AsyncSession, story: Story, ctx: LlmCtx) -> None:
+    """Olay sisteminden onceki bolumlerden EKSIK OLAY katmanini cikarir (lazy, bounded,
+    idempotent). YALNIZCA olay: eski bolumlerin entity'leri orijinal uretimde zaten cikarildi,
+    burada entity eklemek (tekrar eden protagonist -> characters unique-constraint) hem
+    gereksiz hem riskli. Constraint'ler: (1) her koşuda EN FAZLA BACKFILL_PER_RUN bolum;
+    (2) uretimi BLOKLAMAZ — asil bolum zaten SSE ile gonderildi, buradaki patlama izole edilir;
+    (3) en YENI event'siz bolumden geriye dogru (retrieval'da en cok ise yarar); (4) sonsuz
+    deneme yok — backfill_attempts >= MAX ise atlanir.
+
+    Cikarim KULLANICI anahtariyla (ctx), embed SUNUCU anahtariyla (embed_for_user).
+    Aday bolumler DUZ DEGER olarak cekilir: commit/rollback arasi ORM nesnesi tutmak async'te
+    bayat-nesne/lazy-load sorunlari cikarir."""
+    rows = (
+        await db.execute(
+            select(Chapter.id, Chapter.index, Chapter.content, Chapter.backfill_attempts)
+            .where(
+                Chapter.story_id == story.id,
+                Chapter.backfill_attempts < MAX_BACKFILL_ATTEMPTS,
+                ~select(Event.id).where(Event.chapter_id == Chapter.id).exists(),
+            )
+            .order_by(Chapter.index.desc())  # en yeni once
+            .limit(BACKFILL_PER_RUN)
+        )
+    ).all()
+    for chap_id, chap_index, content, attempts in rows:
+        # Denemeyi ONCE kalicilastir: cikarim patlasa bile sayilsin (sonsuz retry olmasin).
+        await db.execute(update(Chapter).where(Chapter.id == chap_id).values(backfill_attempts=attempts + 1))
+        await db.commit()
+        try:
+            parsed = await ai.chat_json(
+                ctx,
+                ctx.util_model,
+                ENTITY_EXTRACTION_PROMPT,
+                f"Chapter to process:\n\n{content[:15000]}",
+                temperature=0.2,
+                max_tokens=2048,
+                reasoning=False,  # util isi: reasoning gereksiz + output olarak faturalanir
+            )
+            created = _apply_events(db, story.id, chap_id, parsed)
+            await _embed_events(db, story.user_id, created)
+            await db.commit()
+        except Exception:
+            # Bu bolumun yarim kalan event'lerini geri al (attempts zaten commit'li);
+            # digerlerini denemeye devam et. Uretim etkilenmez.
+            await db.rollback()
+            logger.warning(
+                "Bolum %s olay backfill'i basarisiz (deneme %s/%s)",
+                chap_index, attempts + 1, MAX_BACKFILL_ATTEMPTS, exc_info=True,
+            )
 
 
 def _clean_entries(raw, *fields: str) -> list[dict]:
@@ -153,8 +309,11 @@ def _clean_entries(raw, *fields: str) -> list[dict]:
     return cleaned
 
 
-def _apply_entities(db: AsyncSession, story: Story, parsed: dict) -> None:
-    """Cikarilan varliklari isimle upsert eder; ayni isim ikinci kez kaydedilmez."""
+def _apply_entities(db: AsyncSession, story: Story, parsed: dict, *, include_updates: bool = True) -> None:
+    """Cikarilan varliklari isimle upsert eder; ayni isim ikinci kez kaydedilmez.
+    include_updates=False iken yalnizca YENI varliklar eklenir (updated_characters yok
+    sayilir): bolum duzenleme yolunda mevcut karakterin durumu clobber'lanmasin ve
+    hicbir sey silinmesin diye."""
     chars = {c.name.casefold(): c for c in story.characters}
     locs = {l.name.casefold(): l for l in story.locations}
     items = {i.name.casefold(): i for i in story.items}
@@ -169,16 +328,17 @@ def _apply_entities(db: AsyncSession, story: Story, parsed: dict) -> None:
         db.add(obj)
         chars[key] = obj
 
-    for entry in _clean_entries(parsed.get("updated_characters"), "status_change"):
-        key = entry["name"].casefold()
-        obj = chars.get(key)
-        if obj is None:
-            # Model "bilinen" sanip yeni bir isim de verebilir; kaybetmek yerine olustur
-            obj = Character(story_id=story.id, name=entry["name"], description="")
-            db.add(obj)
-            chars[key] = obj
-        if entry["status_change"]:
-            obj.status = entry["status_change"]
+    if include_updates:
+        for entry in _clean_entries(parsed.get("updated_characters"), "status_change"):
+            key = entry["name"].casefold()
+            obj = chars.get(key)
+            if obj is None:
+                # Model "bilinen" sanip yeni bir isim de verebilir; kaybetmek yerine olustur
+                obj = Character(story_id=story.id, name=entry["name"], description="")
+                db.add(obj)
+                chars[key] = obj
+            if entry["status_change"]:
+                obj.status = entry["status_change"]
 
     for entry in _clean_entries(parsed.get("new_locations"), "description"):
         key = entry["name"].casefold()
@@ -195,44 +355,130 @@ def _apply_entities(db: AsyncSession, story: Story, parsed: dict) -> None:
             items[key] = obj
 
 
+def _clean_events(raw) -> list[dict]:
+    """LLM'den gelen olay listesini savunmaci temizler: text bos olanlari eler, importance'i
+    0.0-1.0'a kelepceler (model tanimsiz/gecersiz verirse 0.5), metni kirpar, en fazla
+    MAX_EVENTS_PER_CHAPTER olay dondurur (uzun bolumde onlarca olay birikmesin)."""
+    if not isinstance(raw, list):
+        return []
+    cleaned: list[dict] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        text = str(entry.get("text") or "").strip()[:EVENT_TEXT_CAP]
+        if not text:
+            continue
+        try:
+            importance = float(entry.get("importance"))
+        except (TypeError, ValueError):
+            importance = 0.5
+        importance = min(1.0, max(0.0, importance))
+        cleaned.append({"text": text, "importance": importance})
+        if len(cleaned) >= MAX_EVENTS_PER_CHAPTER:
+            break
+    return cleaned
+
+
+def _apply_events(db: AsyncSession, story_id: int, chapter_id: int, parsed: dict) -> list[Event]:
+    """Cikarilan olaylari events tablosuna EKLER ve olusturulan Event nesnelerini dondurur
+    (cagiran bunlari tek batch cagriyla embedler). embedding once NULL'dur; silme yok —
+    dusuk importance sadece omurgaya girmemek demek, depodan silinmek degil."""
+    created: list[Event] = []
+    for ev in _clean_events(parsed.get("events")):
+        obj = Event(
+            story_id=story_id,
+            chapter_id=chapter_id,
+            text=ev["text"],
+            importance=ev["importance"],
+        )
+        db.add(obj)
+        created.append(obj)
+    return created
+
+
+async def _embed_events(db: AsyncSession, user_id: int, events: list[Event]) -> None:
+    """Verilen olaylari TEK embeddings cagrisiyla (batch) embedler. Kota bu yola baglidir
+    (embed_for_user -> consume_quota). Cagri patlarsa olaylar embedding'siz (NULL) kalir ve
+    uretim BLOKLANMAZ; sonraki telafi adiminda yeniden denenir.
+
+    Cagiranlar yalnizca embed'lenmesi gereken olaylari verir (yeni olusturulanlar ya da
+    'embedding IS NULL' ile sorgulanmis olaylar); burada e.embedding'e ERISME — deferred
+    kolon oldugu icin async'te lazy-load tetikleyip MissingGreenlet atar."""
+    pending = [e for e in events if (e.text or "").strip()]
+    if not pending:
+        return
+    try:
+        vectors = await embeddings.embed_for_user(db, user_id, [e.text for e in pending])
+    except embeddings.EmbedQuotaExceeded:
+        logger.warning("Kullanici %s embed kotasi doldu; olaylar NULL embedding ile kaldi", user_id)
+        return
+    except Exception:
+        logger.warning("Olay embedleme basarisiz; olaylar NULL embedding ile kaydedildi", exc_info=True)
+        return
+    for event, vector in zip(pending, vectors):
+        event.embedding = vector
+
+
 def _excerpt(text: str) -> str:
     return text[:EXCERPT_CHARS] + ("..." if len(text) > EXCERPT_CHARS else "")
 
 
-async def find_similar_chapters(
-    db: AsyncSession, story: Story, query: str, limit: int = 2, exclude_from_index: int | None = None
-) -> list[tuple[int, float]]:
-    """Sorguya anlamca en yakin bolumleri (index, distance) olarak dondurur.
-    exclude_from_index verilirse o indeks ve sonrasi aramaya girmez."""
-    query_vec = await ai.embed(query)
+async def story_has_embedded_events(db: AsyncSession, story_id: int) -> bool:
+    """Hikayede embed'lenmis en az bir olay var mi? (Sorguyu bosuna embedlememek /
+    kotayi harcamamak icin retrieval'dan once ucuz kontrol.)"""
+    stmt = select(Event.id).where(Event.story_id == story_id, Event.embedding.isnot(None)).limit(1)
+    return (await db.execute(stmt)).first() is not None
+
+
+async def find_relevant_events(
+    db: AsyncSession, story: Story, query: str, limit: int = EVENT_RETRIEVAL_LIMIT, *, bump: bool = False
+) -> list[tuple[Event, float]]:
+    """Sorguya anlamca en yakin olaylari (Event, distance) dondurur — OpenAI uzayinda cosine.
+    Yalnizca embedding'i dolu olaylar aranir (Gemini chapters.embedding'e ASLA dokunulmaz).
+    bump=True ise eslesen olaylarin importance'i (azalan artis, CEIL sinirli) ve
+    retrieved_count'u yukselir (dinamik onem — olay gercekten baglama cekildiginde)."""
+    query_vec = (await embeddings.embed_for_user(db, story.user_id, [query]))[0]
     stmt = (
-        select(Chapter.index, Chapter.embedding.cosine_distance(query_vec).label("dist"))
-        .where(Chapter.story_id == story.id, Chapter.embedding.isnot(None))
+        select(Event, Event.embedding.cosine_distance(query_vec).label("dist"))
+        .where(Event.story_id == story.id, Event.embedding.isnot(None))
         .order_by("dist")
         .limit(limit)
     )
-    if exclude_from_index is not None:
-        stmt = stmt.where(Chapter.index < exclude_from_index)
     rows = (await db.execute(stmt)).all()
-    return [(row.index, float(row.dist)) for row in rows]
+    hits: list[tuple[Event, float]] = []
+    for event, dist in rows:
+        hits.append((event, float(dist)))
+        if bump:
+            event.importance = min(
+                IMPORTANCE_CEIL, event.importance + (IMPORTANCE_CEIL - event.importance) * IMPORTANCE_GROWTH
+            )
+            event.retrieved_count += 1
+    return hits
 
 
 async def _retrieve_relevant_block(db: AsyncSession, story: Story, query: str) -> str | None:
-    """n-1/n/n+1 penceresi: eslesen bolumlerin komsulariyla birlikte alintisini kurar."""
-    # Son iki bolum zaten prompta tam metin olarak giriyor; aramaya dahil etme
-    cutoff = story.chapters[-1].index - 1 if len(story.chapters) >= 2 else story.chapters[-1].index
-    hits = await find_similar_chapters(db, story, query, limit=2, exclude_from_index=cutoff)
+    """Olay->chapter->pencere: eslesen olaylarin bolumlerini n-1/n/n+1 komsulariyla alintiler.
+    Olayi olmayan hikayede None doner (RAG blogu atlanir; uretim ozet+son2+entity ile devam eder)."""
+    if not await story_has_embedded_events(db, story.id):
+        return None
+    hits = await find_relevant_events(db, story, query, bump=True)
     if not hits:
         return None
 
+    # Son iki bolum zaten prompta tam metin olarak giriyor; aramaya dahil etme
+    cutoff = story.chapters[-1].index - 1 if len(story.chapters) >= 2 else story.chapters[-1].index
+    id_to_index = {c.id: c.index for c in story.chapters}
+
     wanted: set[int] = set()
-    for index, _ in hits:
-        wanted.update({index - 1, index, index + 1})
+    for event, _ in hits:
+        index = id_to_index.get(event.chapter_id)
+        if index is not None:
+            wanted.update({index - 1, index, index + 1})
     wanted = {i for i in wanted if 1 <= i < cutoff}
 
     chapter_map = {c.index: c for c in story.chapters}
     blocks = [
-        f"--- Bölüm {i} ---\n{_excerpt(chapter_map[i].content)}"
+        f"--- Chapter {i} ---\n{_excerpt(chapter_map[i].content)}"
         for i in sorted(wanted)
         if i in chapter_map
     ]

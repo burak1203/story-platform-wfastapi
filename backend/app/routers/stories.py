@@ -2,12 +2,13 @@ import asyncio
 import json
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..ai import client as ai
+from ..ai import embeddings
+from ..ai.client import LlmCtx
 from ..database import get_db
 from ..models import Story, User
 from ..ai.prompts import parse_edit_notes
@@ -19,11 +20,20 @@ from ..schemas import (
     SearchHit,
     SearchWindowChapter,
     StoryDetailResponse,
+    StorySummaryResponse,
     UpdateStorySettingsRequest,
     story_detail,
+    story_summary,
 )
-from ..security import get_current_user
-from ..services.generation import find_similar_chapters, schedule_generation, summarize_chapter
+from ..ratelimit import GENERATION_LIMIT, SEARCH_LIMIT, limiter
+from ..security import get_current_user, get_llm_ctx
+from ..services.generation import (
+    apply_new_entities_from_edit,
+    find_relevant_events,
+    schedule_generation,
+    story_has_embedded_events,
+    summarize_chapter,
+)
 from ..services.sse import broker
 
 logger = logging.getLogger(__name__)
@@ -43,24 +53,27 @@ async def _get_owned_story(story_id: int, user: User, db: AsyncSession) -> Story
     return story
 
 
-@router.get("/my-stories", response_model=list[StoryDetailResponse])
+@router.get("/my-stories", response_model=list[StorySummaryResponse])
 async def my_stories(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     stories = (
         (await db.execute(select(Story).where(Story.user_id == user.id).order_by(Story.id.desc())))
         .scalars()
         .all()
     )
-    return [story_detail(s) for s in stories]
+    return [story_summary(s) for s in stories]
 
 
 @router.post("", response_model=StoryDetailResponse)
+@limiter.limit(GENERATION_LIMIT)
 async def create_story(
-    request: CreateStoryRequest,
+    request: Request,
+    payload: CreateStoryRequest,
     user: User = Depends(get_current_user),
+    ctx: LlmCtx = Depends(get_llm_ctx),
     db: AsyncSession = Depends(get_db),
 ):
-    title = request.title.strip()
-    prompt = request.starting_prompt.strip()
+    title = payload.title.strip()
+    prompt = payload.starting_prompt.strip()
     if not title or not prompt:
         raise HTTPException(status_code=400, detail="Başlık ve başlangıç konusu boş olamaz.")
 
@@ -69,15 +82,15 @@ async def create_story(
         title=title,
         status="PENDING",
         initial_prompt=prompt,
-        style_prompt=(request.style_prompt or "").strip() or None,
-        negative_prompt=(request.negative_prompt or "").strip() or None,
+        style_prompt=(payload.style_prompt or "").strip() or None,
+        negative_prompt=(payload.negative_prompt or "").strip() or None,
     )
     db.add(story)
     await db.commit()
     # Yeni eklenen nesnenin iliskileri yuklu degil; async'te lazy-load patladigi icin tazele
     story = await db.get(Story, story.id, populate_existing=True)
 
-    schedule_generation(story.id, None)
+    schedule_generation(story.id, None, ctx)
     return story_detail(story)
 
 
@@ -90,13 +103,16 @@ async def get_story(
 
 
 @router.post("/{story_id}/continue")
+@limiter.limit(GENERATION_LIMIT)
 async def continue_story(
+    request: Request,
     story_id: int,
-    request: ContinueStoryRequest,
+    payload: ContinueStoryRequest,
     user: User = Depends(get_current_user),
+    ctx: LlmCtx = Depends(get_llm_ctx),
     db: AsyncSession = Depends(get_db),
 ):
-    action = request.user_action.strip()
+    action = payload.user_action.strip()
     if not action:
         raise HTTPException(status_code=400, detail="Hamle boş olamaz.")
 
@@ -118,7 +134,7 @@ async def continue_story(
             detail="Bu hikaye için zaten bir bölüm üretiliyor, lütfen bitmesini bekleyin.",
         )
 
-    schedule_generation(story_id, action)
+    schedule_generation(story_id, action, ctx)
     return {"status": new_status}
 
 
@@ -147,14 +163,17 @@ async def update_story_settings(
 
 
 @router.put("/{story_id}/chapters/{chapter_index}", response_model=StoryDetailResponse)
+@limiter.limit(GENERATION_LIMIT)
 async def edit_chapter(
+    request: Request,
     story_id: int,
     chapter_index: int,
-    request: EditChapterRequest,
+    payload: EditChapterRequest,
     user: User = Depends(get_current_user),
+    ctx: LlmCtx = Depends(get_llm_ctx),
     db: AsyncSession = Depends(get_db),
 ):
-    new_content = request.new_content.strip()
+    new_content = payload.new_content.strip()
     if not new_content:
         raise HTTPException(status_code=400, detail="Bölüm içeriği boş olamaz.")
 
@@ -172,16 +191,29 @@ async def edit_chapter(
     # Icerik degisti; vektor hafizayi da guncelle (basarisizsa eski vektorle devam etmek
     # yerine None birakiyoruz ki arama yanlis sonuc dondurmesin)
     try:
-        chapter.embedding = await ai.embed(new_content)
+        chapter.embedding = (await embeddings.embed_for_user(db, user.id, [new_content]))[0]
+    except embeddings.EmbedQuotaExceeded:
+        logger.warning("Kullanici %s embed kotasi doldu; duzenlenen bolum vektorsuz kaldi", user.id)
+        chapter.embedding = None
     except Exception:
         logger.warning("Duzenlenen bolumun embeddingi guncellenemedi", exc_info=True)
         chapter.embedding = None
 
-    # Ozeti guncel metne gore yeniden cikar (elle ozet ucuyla ayrica duzeltilebilir)
+    # Ozeti guncel metne gore yeniden cikar. Basarisizsa eski (artik yanlis) ozeti
+    # tutmak yerine None birak; bir sonraki uretimdeki telafi adimi tamamlar.
     try:
-        chapter.summary = await summarize_chapter(new_content) or chapter.summary
+        chapter.summary = await summarize_chapter(ctx, new_content)
     except Exception:
         logger.warning("Duzenlenen bolum yeniden ozetlenemedi", exc_info=True)
+        chapter.summary = None
+
+    # Duzenlenen metinde yeni beliren karakter/mekan/esyalar evrene EKLENIR. Yalnizca
+    # ekleme: hicbir sey otomatik silinmez, mevcut varliklarin durumu degistirilmez
+    # (silme yalnizca Studio'dan elle). Cikarim patlarsa duzenlemeyi engelleme.
+    try:
+        await apply_new_entities_from_edit(db, story, chapter.id, new_content, ctx)
+    except Exception:
+        logger.warning("Duzenlenen bolumden entity/olay cikarimi atlandi", exc_info=True)
 
     # Bir SONRAKI uretime tasinacak not: modele "burada su degisti" diye soyle
     notes = parse_edit_notes(story.pending_edit_notes)
@@ -215,14 +247,45 @@ async def edit_chapter_summary(
     return story_detail(story)
 
 
+def _chapter_window(chapter_map: dict[int, object], index: int) -> list[SearchWindowChapter]:
+    """Bir bolumun n-1/n/n+1 penceresini (mevcut olanlarla) kurar."""
+    return [
+        SearchWindowChapter(index=i, excerpt=chapter_map[i].content[:1200])
+        for i in (index - 1, index, index + 1)
+        if i in chapter_map
+    ]
+
+
+def _keyword_search(story: Story, query: str, chapter_map: dict[int, object]) -> list[SearchHit]:
+    """Olay-embed yoksa (eski hikaye / backfill oncesi) vektorsuz fallback: sorgu kelimelerini
+    iceren bolumleri dondurur. Vektor uzayi karismaz; hicbir esdeger yoksa gercekten bos doner.
+    distance=-1.0 = 'anahtar-kelime fallback, vektor mesafesi yok' isareti."""
+    terms = [t for t in query.lower().split() if len(t) >= 3]
+    if not terms:
+        return []
+    scored: list[tuple[int, int]] = []
+    for chapter in story.chapters:
+        text = chapter.content.lower()
+        score = sum(text.count(t) for t in terms)
+        if score > 0:
+            scored.append((score, chapter.index))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return [
+        SearchHit(chapter_index=index, distance=-1.0, window=_chapter_window(chapter_map, index))
+        for _, index in scored[:3]
+    ]
+
+
 @router.get("/{story_id}/search", response_model=list[SearchHit])
+@limiter.limit(SEARCH_LIMIT)
 async def search_story(
+    request: Request,
     story_id: int,
     query: str,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    query = query.strip()
+    query = query.strip()[:500]
     if not query:
         raise HTTPException(status_code=400, detail="Arama sorgusu boş olamaz.")
 
@@ -230,18 +293,33 @@ async def search_story(
     if not story.chapters:
         return []
 
-    hits = await find_similar_chapters(db, story, query, limit=3, exclude_last=False)
     chapter_map = {c.index: c for c in story.chapters}
+    id_to_index = {c.id: c.index for c in story.chapters}
 
-    results: list[SearchHit] = []
-    for index, distance in hits:
-        window = [
-            SearchWindowChapter(index=i, excerpt=chapter_map[i].content[:1200])
-            for i in (index - 1, index, index + 1)
-            if i in chapter_map
-        ]
-        results.append(SearchHit(chapter_index=index, distance=distance, window=window))
-    return results
+    # Olay-embed varsa birincil yol: olay -> chapter_id -> distinct bolum (en iyi mesafe) -> pencere.
+    # Olay yoksa vektor uzayi karistirmamak icin anahtar-kelime fallback'ine dus.
+    if not await story_has_embedded_events(db, story.id):
+        return _keyword_search(story, query, chapter_map)
+
+    try:
+        hits = await find_relevant_events(db, story, query, bump=False)
+    except embeddings.EmbedQuotaExceeded:
+        raise HTTPException(
+            status_code=429, detail="Günlük arama/embed kotan doldu, yarın tekrar dene."
+        )
+
+    best: dict[int, float] = {}  # bolum indeksi -> en kucuk (en yakin) mesafe
+    for event, distance in hits:
+        index = id_to_index.get(event.chapter_id)
+        if index is None:
+            continue
+        if index not in best or distance < best[index]:
+            best[index] = distance
+
+    return [
+        SearchHit(chapter_index=index, distance=best[index], window=_chapter_window(chapter_map, index))
+        for index in sorted(best, key=lambda i: best[i])
+    ]
 
 
 @router.get("/{story_id}/stream")
