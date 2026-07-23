@@ -1,7 +1,17 @@
-from datetime import datetime
+from datetime import date, datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import (
+    Date,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .config import settings
@@ -20,10 +30,23 @@ class User(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     username: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     email: Mapped[str | None] = mapped_column(String(255), unique=True, nullable=True)
-    password_hash: Mapped[str] = mapped_column(String(255))
+    # Google ile acilan hesaplarin sifresi yoktur (None); sifreli giriste None reddedilir
+    password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     stories: Mapped[list["Story"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+
+
+class EmbedUsage(Base):
+    """Kullanici basina gunluk embed cagri sayaci (kotu niyetli kota tuketimine karsi)."""
+
+    __tablename__ = "embed_usage"
+
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    day: Mapped[date] = mapped_column(Date, primary_key=True)
+    count: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class Story(Base):
@@ -72,9 +95,44 @@ class Chapter(Base):
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     # deferred: bolum listesi cekilirken 768 float'lik vektorler bosuna yuklenmesin
     embedding = mapped_column(Vector(settings.embedding_dim), nullable=True, deferred=True)
+    # Olay sisteminden onceki bolumler icin lazy backfill deneme sayaci: sonsuz yeniden
+    # deneme olmasin diye (MAX'a ulasinca o bolum backfill'de artik denenmez).
+    backfill_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     story: Mapped[Story] = relationship(back_populates="chapters")
+
+
+class Event(Base):
+    """Olay-tabanli hafizanin cekirdegi: her bolumden cikarilan, KENDI BASINA anlasilir
+    olaylar. Her olay embed'lenip (C3) sonsuza dek saklanir; RAG'le geri cagrildikca
+    importance'i yukselir (retrieved_count). Silme YOK: dusuk importance = "her turda sabit
+    omurgada gitmez" demek, depodan silinmek degil.
+
+    embedding NULLABLE: C2'de olaylar embedding'siz olusur; C3'te embedding'i NULL olan
+    olaylar doldurulur. Bu sayede C2-C3 arasi uretilen olaylar kaybolmaz."""
+
+    __tablename__ = "events"
+    __table_args__ = (
+        # Olay-embed uzerinden cosine retrieval (C3). NULL embedding'ler indekste yer tutmaz.
+        Index(
+            "ix_events_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    story_id: Mapped[int] = mapped_column(ForeignKey("stories.id", ondelete="CASCADE"), index=True)
+    chapter_id: Mapped[int] = mapped_column(ForeignKey("chapters.id", ondelete="CASCADE"), index=True)
+    text: Mapped[str] = mapped_column(Text)
+    # 0.0-1.0: yazimda on-tahmin; RAG'le cekildikce yukselir (dinamik onem)
+    importance: Mapped[float] = mapped_column(Float, default=0.5)
+    retrieved_count: Mapped[int] = mapped_column(Integer, default=0)
+    # deferred: olay listesi cekilirken 768 float bosuna yuklenmesin
+    embedding = mapped_column(Vector(settings.embedding_dim), nullable=True, deferred=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
 class Character(Base):
