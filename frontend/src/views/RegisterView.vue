@@ -2,6 +2,7 @@
 import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/authStore'
+import GoogleSignInButton from '@/components/GoogleSignInButton.vue'
 
 const router = useRouter()
 const authStore = useAuthStore()
@@ -83,6 +84,8 @@ const handleRegister = async () => {
           {{ authStore.isLoading ? 'Kayıt Olunuyor...' : 'Kayıt Ol' }}
         </button>
       </form>
+
+      <GoogleSignInButton />
 
       <div class="mt-6 text-center text-sm text-slate-400">
         Zaten hesabın var mı?

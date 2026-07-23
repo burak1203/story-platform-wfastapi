@@ -2,10 +2,11 @@
 import { ref, computed, onMounted, nextTick, watch, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { useStoryStore } from '@/stores/storyStore'
+import { useLlmKeyStore } from '@/stores/llmKeyStore'
 import type { ElementDto, ElementKind } from '@/types'
-import { marked } from 'marked'
 
 const store = useStoryStore()
+const llmKeyStore = useLlmKeyStore()
 const route = useRoute()
 const userAction = ref('')
 const scrollContainer = ref<HTMLElement | null>(null)
@@ -51,12 +52,8 @@ watch(
   },
 )
 
-const renderedChapters = computed(() => {
-  return (store.story?.chapters || []).map((c) => ({
-    ...c,
-    html: marked.parse(c.content, { breaks: true }) as string,
-  }))
-})
+// Guvenlik: LLM/kullanici icerigi HTML olarak degil, her zaman duz metin olarak basilir
+const chapters = computed(() => store.story?.chapters || [])
 
 watch(
   () => store.story?.content,
@@ -165,6 +162,14 @@ const elementSections = computed(() => [
       <div class="flex items-center gap-2 mb-4 text-sm text-slate-400">
         <span class="bg-slate-700 px-2 py-1 rounded">Durum: {{ store.story?.status || '...' }}</span>
         <span class="bg-slate-700 px-2 py-1 rounded">Bölüm: {{ store.story?.actionCount || 0 }}</span>
+        <button
+          @click="llmKeyStore.openModal()"
+          class="bg-slate-700 hover:bg-slate-600 px-2 py-1 rounded transition-colors"
+          :class="{ 'text-amber-500': !llmKeyStore.hasKey }"
+          title="Gemini API anahtarını yönet"
+        >
+          🔑
+        </button>
       </div>
 
       <!-- Yazım Ayarları -->
@@ -251,7 +256,7 @@ const elementSections = computed(() => [
 
       <div ref="scrollContainer" class="flex-1 overflow-y-auto p-10 pb-36">
         <div
-          v-for="chapter in renderedChapters"
+          v-for="chapter in chapters"
           :key="'ch-' + chapter.id"
           class="mb-10"
         >
@@ -268,9 +273,8 @@ const elementSections = computed(() => [
 
           <div
             v-if="editingChapterIndex !== chapter.index"
-            class="prose prose-invert max-w-none prose-p:leading-relaxed prose-p:mb-6 prose-a:text-amber-500"
-            v-html="chapter.html"
-          ></div>
+            class="max-w-none text-gray-100 leading-relaxed whitespace-pre-wrap"
+          >{{ chapter.content }}</div>
 
           <div v-else class="flex flex-col gap-3">
             <textarea

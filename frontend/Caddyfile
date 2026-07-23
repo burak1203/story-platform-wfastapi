@@ -1,0 +1,22 @@
+# SITE_ADDRESS ornekleri:
+#   Prod : A-B-C-D.sslip.io   (VM'nin IP'si A.B.C.D ise; Caddy sertifikayi otomatik alir)
+#   Lokal: :80                (sertifikasiz duz HTTP)
+{$SITE_ADDRESS} {
+	handle /api/* {
+		reverse_proxy backend:8000 {
+			flush_interval -1
+		}
+	}
+
+	handle {
+		root * /srv
+		try_files {path} /index.html
+		file_server
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Frame-Options "DENY"
+		X-Content-Type-Options "nosniff"
+	}
+}

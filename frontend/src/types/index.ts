@@ -14,6 +14,15 @@ export interface ChapterDto {
 
 export type ElementKind = 'characters' | 'locations' | 'items'
 
+// Dashboard listesi icin hafif ozet (bolum metni tasimaz; tam icerik detay ucundan gelir)
+export interface StorySummaryResponse {
+  id: number
+  title: string
+  status: string
+  actionCount: number
+  currentSummary: string | null
+}
+
 export interface StoryDetailResponse {
   id: number
   title: string

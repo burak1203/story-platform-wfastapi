@@ -1,14 +1,32 @@
 import { defineStore } from 'pinia'
 import axios from 'axios'
-import type { StoryDetailResponse, CreateStoryRequest, ElementKind } from '../types'
+import type {
+  StoryDetailResponse,
+  StorySummaryResponse,
+  CreateStoryRequest,
+  ElementKind,
+} from '../types'
+import { useLlmKeyStore } from './llmKeyStore'
 
-const API_URL = 'http://localhost:8000/api/stories'
-const ELEMENTS_URL = 'http://localhost:8000/api/elements'
+const API_URL = '/api/stories'
+const ELEMENTS_URL = '/api/elements'
+
+const LLM_KEY_MESSAGE = 'Set up your LLM provider (base URL + model + key) to generate chapters.'
+
+// Backend ayar eksik/geçersiz dediyse ayar modalini açar; true dönerse hata ele alındı
+function redirectToKeyModal(err: any): boolean {
+  const detail = err?.response?.data?.detail
+  if (detail === 'llm_config_missing' || detail === 'llm_key_invalid') {
+    useLlmKeyStore().openModal()
+    return true
+  }
+  return false
+}
 
 export const useStoryStore = defineStore('story', {
   state: () => ({
     story: null as StoryDetailResponse | null,
-    myStories: [] as StoryDetailResponse[], // YENİ: Kullanıcının hikayeleri
+    myStories: [] as StorySummaryResponse[], // dashboard için hafif özet listesi
     isLoading: false,
     error: null as string | null,
     eventSource: null as EventSource | null,
@@ -21,7 +39,7 @@ export const useStoryStore = defineStore('story', {
       this.isLoading = true
       this.error = null
       try {
-        const response = await axios.get<StoryDetailResponse[]>(`${API_URL}/my-stories`)
+        const response = await axios.get<StorySummaryResponse[]>(`${API_URL}/my-stories`)
         this.myStories = response.data
       } catch (err: any) {
         this.error = err.message || 'Hikayeler yüklenemedi.'
@@ -32,13 +50,22 @@ export const useStoryStore = defineStore('story', {
 
     // Sıfırdan hikaye oluşturur ve yönlendirme için döner
     async createStory(payload: CreateStoryRequest) {
+      const llmKey = useLlmKeyStore()
+      if (!llmKey.hasKey) {
+        llmKey.openModal()
+        this.error = LLM_KEY_MESSAGE
+        throw new Error(LLM_KEY_MESSAGE)
+      }
+
       this.isLoading = true
       this.error = null
       try {
         const response = await axios.post<StoryDetailResponse>(API_URL, payload)
         return response.data
       } catch (err: any) {
-        this.error = err.message || 'Hikaye oluşturulamadı.'
+        this.error = redirectToKeyModal(err)
+          ? LLM_KEY_MESSAGE
+          : err.response?.data?.detail || err.message || 'Hikaye oluşturulamadı.'
         throw err
       } finally {
         this.isLoading = false
@@ -118,6 +145,13 @@ export const useStoryStore = defineStore('story', {
     },
 
     async continueStory(storyId: number, userAction: string) {
+      const llmKey = useLlmKeyStore()
+      if (!llmKey.hasKey) {
+        llmKey.openModal()
+        this.error = LLM_KEY_MESSAGE
+        return
+      }
+
       this.isLoading = true
       this.error = null
       this.startWatchdog()
@@ -127,7 +161,9 @@ export const useStoryStore = defineStore('story', {
           userAction: userAction,
         })
       } catch (err: any) {
-        this.error = err.message || 'Hamle gönderilemedi.'
+        this.error = redirectToKeyModal(err)
+          ? LLM_KEY_MESSAGE
+          : err.response?.data?.detail || err.message || 'Hamle gönderilemedi.'
         this.stopWatchdog()
         this.isLoading = false // KRİTİK: Hata alırsan butonu kilitten kurtar
       }
@@ -163,6 +199,14 @@ export const useStoryStore = defineStore('story', {
     // Herhangi bir bölümün metnini düzenler; backend özeti ve vektörü yeniler,
     // bir sonraki üretime "burada şu değişti" notu düşer
     async editChapter(storyId: number, chapterIndex: number, newContent: string) {
+      const llmKey = useLlmKeyStore()
+      if (!llmKey.hasKey) {
+        // Düzenleme sonrası yeniden özet kullanıcının anahtarıyla çıkarılır
+        llmKey.openModal()
+        this.error = LLM_KEY_MESSAGE
+        throw new Error(LLM_KEY_MESSAGE)
+      }
+
       this.isLoading = true
       this.error = null
       try {
@@ -171,7 +215,9 @@ export const useStoryStore = defineStore('story', {
         })
         this.story = response.data
       } catch (err: any) {
-        this.error = err.response?.data?.detail || err.message || 'Bölüm güncellenemedi.'
+        this.error = redirectToKeyModal(err)
+          ? LLM_KEY_MESSAGE
+          : err.response?.data?.detail || err.message || 'Bölüm güncellenemedi.'
         throw err
       } finally {
         this.isLoading = false

@@ -15,4 +15,10 @@ export default defineConfig({
       '@': fileURLToPath(new URL('./src', import.meta.url)),
     },
   },
+  server: {
+    // Prod'da Caddy'nin yaptigi isi dev'de Vite yapar: /api -> backend
+    proxy: {
+      '/api': 'http://localhost:8000',
+    },
+  },
 })

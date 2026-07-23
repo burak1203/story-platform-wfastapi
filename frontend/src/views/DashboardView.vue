@@ -3,10 +3,12 @@ import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useStoryStore } from '@/stores/storyStore'
 import { useAuthStore } from '@/stores/authStore'
+import { useLlmKeyStore } from '@/stores/llmKeyStore'
 
 const router = useRouter()
 const storyStore = useStoryStore()
 const authStore = useAuthStore()
+const llmKeyStore = useLlmKeyStore()
 
 const isCreating = ref(false)
 const newTitle = ref('')
@@ -51,12 +53,21 @@ const handleDelete = async (id: number) => {
   <div class="min-h-screen bg-slate-900 text-gray-200 font-sans p-8">
     <header class="flex justify-between items-center mb-12 border-b border-slate-700 pb-6">
       <h1 class="text-3xl font-bold text-amber-500">Hikayelerim</h1>
-      <button
-        @click="handleLogout"
-        class="text-sm bg-slate-800 hover:bg-slate-700 px-4 py-2 rounded border border-slate-600 transition-colors"
-      >
-        Çıkış Yap
-      </button>
+      <div class="flex gap-3">
+        <button
+          @click="llmKeyStore.openModal()"
+          class="text-sm bg-slate-800 hover:bg-slate-700 px-4 py-2 rounded border border-slate-600 transition-colors"
+          :class="{ 'border-amber-600 text-amber-500': !llmKeyStore.hasKey }"
+        >
+          🔑 API Anahtarı{{ llmKeyStore.hasKey ? '' : ' (gerekli)' }}
+        </button>
+        <button
+          @click="handleLogout"
+          class="text-sm bg-slate-800 hover:bg-slate-700 px-4 py-2 rounded border border-slate-600 transition-colors"
+        >
+          Çıkış Yap
+        </button>
+      </div>
     </header>
 
     <div class="max-w-6xl mx-auto grid grid-cols-1 md:grid-cols-3 gap-6">
@@ -152,7 +163,7 @@ const handleDelete = async (id: number) => {
 
         <div class="flex-1 text-sm text-slate-400 overflow-hidden relative">
           <div class="absolute inset-0 bg-gradient-to-b from-transparent to-slate-800"></div>
-          {{ story.currentSummary || story.content || 'Henüz içerik yok...' }}
+          {{ story.currentSummary || 'Henüz içerik yok...' }}
         </div>
 
         <div

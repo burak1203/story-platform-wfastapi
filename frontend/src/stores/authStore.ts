@@ -1,7 +1,8 @@
 import { defineStore } from 'pinia'
 import axios from 'axios'
 import type { RegisterRequest, AuthenticationRequest, AuthenticationResponse } from '@/types/index'
-const API_URL = 'http://localhost:8000/api/auth'
+// Relative /api: dev'de Vite proxy'si, prod'da Caddy backend'e yonlendirir
+const API_URL = '/api/auth'
 
 export const useAuthStore = defineStore('auth', {
   state: () => ({
@@ -50,6 +51,24 @@ export const useAuthStore = defineStore('auth', {
       } catch (err: any) {
         this.error =
           err.response?.data?.detail || 'Kayıt olunamadı. E-posta veya kullanıcı adı kullanılıyor olabilir.'
+        throw err
+      } finally {
+        this.isLoading = false
+      }
+    },
+
+    // Google Identity Services'ten gelen id_token ile giris; backend dogrulayip kendi JWT'mizi verir
+    async googleLogin(idToken: string) {
+      this.isLoading = true
+      this.error = null
+      try {
+        const response = await axios.post(`${API_URL}/google`, { idToken })
+        this.token = response.data.token
+        this.isAuthenticated = true
+        localStorage.setItem('token', this.token!)
+        this.setAxiosHeader()
+      } catch (err: any) {
+        this.error = err.response?.data?.detail || 'Google ile giriş başarısız.'
         throw err
       } finally {
         this.isLoading = false
