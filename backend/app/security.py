@@ -6,6 +6,7 @@ from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .ai.client import LlmCtx
 from .config import settings
 from .database import get_db
 from .models import User
@@ -55,3 +56,23 @@ async def get_current_user(request: Request, db: AsyncSession = Depends(get_db))
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Kullanici bulunamadi.")
     return user
+
+
+def get_llm_ctx(request: Request) -> LlmCtx:
+    """BYOK: uretim yapan uclarda kullanicinin LLM ayarlarini header'dan alir. Sunucuda
+    varsayilan YOK: base URL + model + anahtar UCU DE gelmeli; eksikse 401 llm_config_missing
+    (frontend bunu ayar modaline yonlendirir). provider opsiyonel (reasoning-kapat icin)."""
+    api_key = (request.headers.get("X-LLM-API-Key") or "").strip()
+    base_url = (request.headers.get("X-LLM-Base-URL") or "").strip()
+    model = (request.headers.get("X-LLM-Model") or "").strip()
+    provider = (request.headers.get("X-LLM-Provider") or "").strip()
+    if not (api_key and base_url and model):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="llm_config_missing")
+
+    return LlmCtx(
+        api_key=api_key,
+        base_url=base_url,
+        story_model=model,
+        util_model=model,
+        provider=provider,
+    )

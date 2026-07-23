@@ -1,5 +1,14 @@
+"""Uretim LLM'ine erisim — BYOK (kullanicinin kendi anahtari).
+
+Global client YOKTUR: her cagri, istekten gelen LlmCtx ile kendi gecici
+istemcisini kurar. Kullanicinin anahtari sunucuda saklanmaz, loglanmaz,
+DB'ye yazilmaz ve hata mesajlarina sizdirilmaz.
+Embedding icin bkz. embeddings.py (SUNUCU anahtariyla calisir).
+"""
+
 import asyncio
 import logging
+from dataclasses import dataclass
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI, RateLimitError
 
@@ -8,18 +17,84 @@ from .json_utils import parse_llm_json
 
 logger = logging.getLogger(__name__)
 
-client = AsyncOpenAI(
-    api_key=settings.llm_api_key,
-    base_url=settings.llm_base_url,
-    max_retries=0,  # retry'i asagida kendimiz yonetiyoruz (backoff surelerini kontrol etmek icin)
-    timeout=180.0,
-)
-
 # Ucretsiz kotayi ve aninda gelen es zamanli istekleri dizginlemek icin global limit
 llm_semaphore = asyncio.Semaphore(settings.llm_concurrency)
 
-# Gemini embedding girisinin token limitini asmamak icin kaba karakter siniri
-EMBED_CHAR_LIMIT = 6000
+
+class LlmKeyInvalid(Exception):
+    """Kullanicinin verdigi anahtar saglayici tarafindan reddedildi."""
+
+
+@dataclass(frozen=True, repr=False)
+class LlmCtx:
+    """Kullanicinin LLM ayarlarini istekten arka plan gorevine tasir. Uretim tarafinda
+    sunucu varsayilani YOK: base_url, story_model, util_model ucu de kullanicidan gelir.
+    provider yalnizca reasoning/thinking-kapat parametresini secmek icin (opsiyonel)."""
+
+    api_key: str
+    base_url: str
+    story_model: str
+    util_model: str
+    provider: str = ""
+
+    def __repr__(self) -> str:  # yanlislikla loglansa bile anahtar gorunmesin
+        return f"LlmCtx(provider={self.provider!r}, base_url={self.base_url!r}, story_model={self.story_model!r})"
+
+
+def _make_client(ctx: LlmCtx) -> AsyncOpenAI:
+    return AsyncOpenAI(
+        api_key=ctx.api_key,
+        base_url=ctx.base_url,
+        max_retries=0,  # retry'i asagida kendimiz yonetiyoruz (backoff surelerini kontrol etmek icin)
+        timeout=180.0,
+    )
+
+
+def _reasoning_off_body(provider: str) -> dict | None:
+    """Saglayici bazli reasoning/thinking 'kapat' govdesi; bilinmeyen saglayiciya None
+    (hicbir sey gonderme -> hata cikmasin)."""
+    p = (provider or "").lower()
+    if p == "deepseek":
+        return {"thinking": {"type": "disabled"}}  # DeepSeek resmi dokumani
+    if p == "openrouter":
+        return {"reasoning": {"enabled": False}}
+    if p == "gemini":
+        return {"google": {"thinking_config": {"thinking_budget": 0}}}
+    # openai / custom / bos: gonderme.
+    return None
+
+
+def _disable_body(ctx: LlmCtx, reasoning: bool) -> dict | None:
+    """Bu cagride reasoning/thinking'i kapatacak govde. Util cagrilarinda (reasoning=False)
+    her saglayicida kapatilir (output olarak faturalaniyor, cikarim isinde gereksiz).
+    DeepSeek'te AYRICA hikaye uretiminde de kapatilir: thinking modunda temperature/top_p/
+    presence_penalty/frequency_penalty sessizce yok sayiliyor; bizim temperature=0.8 cesit-
+    liligimiz olur, uretimler tekduzelesir. (Ileride gelismis modda toggle olacak.)"""
+    if not reasoning or (ctx.provider or "").lower() == "deepseek":
+        return _reasoning_off_body(ctx.provider)
+    return None
+
+
+async def _create(client: AsyncOpenAI, reasoning_off_body: dict | None, **kwargs):
+    """chat.completions.create; reasoning_off_body verildiyse extra_body ile gonderir.
+    Saglayici parametreyi reddederse (400) parametresiz BIR kez daha dener -> destekleme-
+    yen saglayicida util cagrisi patlamaz."""
+    if reasoning_off_body:
+        try:
+            return await client.chat.completions.create(extra_body=reasoning_off_body, **kwargs)
+        except APIStatusError as exc:
+            if exc.status_code == 400:
+                logger.info("Saglayici reasoning-kapat parametresini reddetti; parametresiz denenecek")
+                return await client.chat.completions.create(**kwargs)
+            raise
+    return await client.chat.completions.create(**kwargs)
+
+
+def _is_bad_key(exc: APIStatusError) -> bool:
+    # Gemini gecersiz anahtara bazen 400 "API key not valid" dondurur
+    return exc.status_code in (401, 403) or (
+        exc.status_code == 400 and "api key" in str(exc).lower()
+    )
 
 
 async def _with_retry(coro_factory, what: str):
@@ -31,6 +106,8 @@ async def _with_retry(coro_factory, what: str):
         except (RateLimitError, APITimeoutError, APIConnectionError) as e:
             last_exc = e
         except APIStatusError as e:
+            if _is_bad_key(e):
+                raise LlmKeyInvalid() from e
             if e.status_code < 500:
                 raise
             last_exc = e
@@ -41,64 +118,64 @@ async def _with_retry(coro_factory, what: str):
     raise last_exc
 
 
-async def chat_json(model: str, system: str, user: str, temperature: float = 0.8, max_tokens: int = 8192) -> dict:
-    async def call():
-        async with llm_semaphore:
-            response = await client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                temperature=temperature,
-                max_tokens=max_tokens,
-                response_format={"type": "json_object"},
-            )
-        return response
+async def chat_json(ctx: LlmCtx, model: str, system: str, user: str, temperature: float = 0.8, max_tokens: int = 8192, reasoning: bool = True) -> dict:
+    client = _make_client(ctx)
+    reasoning_off = _disable_body(ctx, reasoning)
+    try:
+        async def call():
+            async with llm_semaphore:
+                response = await _create(
+                    client,
+                    reasoning_off,
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    response_format={"type": "json_object"},
+                )
+            return response
 
-    # Model gecerli JSON uretmezse bir kez daha sans ver (onarim da tutmazsa)
-    last_error: Exception | None = None
-    for attempt in range(2):
+        # Model gecerli JSON uretmezse bir kez daha sans ver (onarim da tutmazsa)
+        last_error: Exception | None = None
+        for attempt in range(2):
+            response = await _with_retry(call, f"LLM cagrisi ({model})")
+            choice = response.choices[0]
+            if choice.finish_reason == "length":
+                logger.warning("LLM cevabi max_tokens sinirinda kesildi; JSON onarimi denenecek.")
+            raw = choice.message.content or ""
+            try:
+                return parse_llm_json(raw)
+            except ValueError as exc:
+                last_error = exc
+                logger.warning("LLM ciktisi JSON olarak ayiklanamadi (deneme %d/2)", attempt + 1)
+        raise last_error
+    finally:
+        await client.close()
+
+
+async def chat_text(ctx: LlmCtx, model: str, system: str, user: str, temperature: float = 0.4, max_tokens: int = 1024, reasoning: bool = True) -> str:
+    client = _make_client(ctx)
+    reasoning_off = _disable_body(ctx, reasoning)
+    try:
+        async def call():
+            async with llm_semaphore:
+                response = await _create(
+                    client,
+                    reasoning_off,
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            return response
+
         response = await _with_retry(call, f"LLM cagrisi ({model})")
-        choice = response.choices[0]
-        if choice.finish_reason == "length":
-            logger.warning("LLM cevabi max_tokens sinirinda kesildi; JSON onarimi denenecek.")
-        raw = choice.message.content or ""
-        try:
-            return parse_llm_json(raw)
-        except ValueError as exc:
-            last_error = exc
-            logger.warning("LLM ciktisi JSON olarak ayiklanamadi (deneme %d/2)", attempt + 1)
-    raise last_error
-
-
-async def chat_text(model: str, system: str, user: str, temperature: float = 0.4, max_tokens: int = 1024) -> str:
-    async def call():
-        async with llm_semaphore:
-            response = await client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-        return response
-
-    response = await _with_retry(call, f"LLM cagrisi ({model})")
-    return (response.choices[0].message.content or "").strip()
-
-
-async def embed(text: str) -> list[float]:
-    async def call():
-        async with llm_semaphore:
-            response = await client.embeddings.create(
-                model=settings.embedding_model,
-                input=text[:EMBED_CHAR_LIMIT],
-                dimensions=settings.embedding_dim,
-            )
-        return response
-
-    response = await _with_retry(call, "Embedding cagrisi")
-    return response.data[0].embedding
+        return (response.choices[0].message.content or "").strip()
+    finally:
+        await client.close()
