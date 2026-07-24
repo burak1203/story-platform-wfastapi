@@ -30,6 +30,7 @@ from ..security import get_current_user, get_llm_ctx
 from ..services.generation import (
     apply_new_entities_from_edit,
     find_relevant_events,
+    rebuild_chapter_chunks,
     schedule_generation,
     story_has_embedded_events,
     summarize_chapter,
@@ -188,16 +189,15 @@ async def edit_chapter(
     old_summary = chapter.summary
     chapter.content = new_content
 
-    # Icerik degisti; vektor hafizayi da guncelle (basarisizsa eski vektorle devam etmek
-    # yerine None birakiyoruz ki arama yanlis sonuc dondurmesin)
+    # NOT: chapters.embedding'e ARTIK YAZILMAZ (eski Gemini uzayi, C4.2'de dusuruluyor; retrieval
+    # olay/chunk-embed'de). Icerik degisince vektor hafiza chunk katmaninda yenilenir (asagida).
+
+    # Chunk katmanini guncel metne gore yeniden bol+embedle (idempotent, LLM YOK). Entity/olay
+    # cikariminin patlamasindan bagimsiz; kendi try/except'inde.
     try:
-        chapter.embedding = (await embeddings.embed_for_user(db, user.id, [new_content]))[0]
-    except embeddings.EmbedQuotaExceeded:
-        logger.warning("Kullanici %s embed kotasi doldu; duzenlenen bolum vektorsuz kaldi", user.id)
-        chapter.embedding = None
+        await rebuild_chapter_chunks(db, story, chapter.id, new_content)
     except Exception:
-        logger.warning("Duzenlenen bolumun embeddingi guncellenemedi", exc_info=True)
-        chapter.embedding = None
+        logger.warning("Duzenlenen bolumun chunk'lari yenilenemedi", exc_info=True)
 
     # Ozeti guncel metne gore yeniden cikar. Basarisizsa eski (artik yanlis) ozeti
     # tutmak yerine None birak; bir sonraki uretimdeki telafi adimi tamamlar.

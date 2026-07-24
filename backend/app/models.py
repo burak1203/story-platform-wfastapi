@@ -135,6 +135,39 @@ class Event(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
+class Chunk(Base):
+    """RAG chunk katmani (C4): bolumun ~400-600 token'lik, LLM'siz, DETERMINISTIK parcalari.
+    Olay katmani KAYIPLI (LLM'in sectigi 3-7 olay iskeleti tasir) — chunk'lar bolumun TAMAMINI
+    kapsar, boylece olay listesine girmemis yerel detay ("1. bolumde dondurma yedi") ileri bir
+    bolumde ilgili hamleyle RAG'le bulunabilir. Bolum uretilince/duzenlenince bolumun chunk'lari
+    silinip yeniden yazilir (idempotent, yetim kalmaz).
+
+    embedding NULLABLE: embed patlarsa chunk NULL ile kaydedilir ve uretim BLOKLANMAZ; telafi
+    yolu (olaylardaki gibi) NULL'lari doldurur. Bu vektorler OpenAI uzayindadir (olaylarla ayni;
+    eski chapters.embedding Gemini uzayindaydi, C4.2'de dusuruldu)."""
+
+    __tablename__ = "chunks"
+    __table_args__ = (
+        UniqueConstraint("chapter_id", "chunk_index"),
+        # Chunk-embed uzerinden cosine retrieval (C4.3). NULL embedding'ler indekste yer tutmaz.
+        Index(
+            "ix_chunks_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    story_id: Mapped[int] = mapped_column(ForeignKey("stories.id", ondelete="CASCADE"), index=True)
+    chapter_id: Mapped[int] = mapped_column(ForeignKey("chapters.id", ondelete="CASCADE"), index=True)
+    chunk_index: Mapped[int] = mapped_column(Integer)
+    text: Mapped[str] = mapped_column(Text)
+    # deferred: chunk listesi cekilirken 768 float bosuna yuklenmesin
+    embedding = mapped_column(Vector(settings.embedding_dim), nullable=True, deferred=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
 class Character(Base):
     __tablename__ = "characters"
     __table_args__ = (UniqueConstraint("story_id", "name"),)

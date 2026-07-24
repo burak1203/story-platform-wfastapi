@@ -2,11 +2,12 @@ import asyncio
 import logging
 
 from openai import RateLimitError
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..ai import client as ai
 from ..ai import embeddings
+from ..ai.chunking import split_into_chunks
 from ..ai.client import LlmCtx, LlmKeyInvalid
 from ..ai.prompts import (
     ENTITY_EXTRACTION_PROMPT,
@@ -16,7 +17,7 @@ from ..ai.prompts import (
     build_chapter_system_prompt,
 )
 from ..database import SessionLocal
-from ..models import Chapter, Character, Event, Item, Location, Story
+from ..models import Chapter, Character, Chunk, Event, Item, Location, Story
 from ..schemas import story_detail
 from .sse import broker
 
@@ -139,7 +140,10 @@ async def _generate_chapter(db: AsyncSession, story_id: int, user_action: str | 
     await db.flush()  # olaylarin FK'si icin chapter.id gerekiyor
     _apply_entities(db, story, parsed)
     created_events = _apply_events(db, story.id, chapter.id, parsed)
-    await _embed_events(db, story.user_id, created_events)  # tek batch; patlarsa NULL kalir
+    await _embed_records(db, story.user_id, created_events)  # tek batch; patlarsa NULL kalir
+    # Chunk katmani: bolumu deterministik parcalara bolup embedle (LLM YOK). Ayri batch cagri.
+    created_chunks = await _apply_chunks(db, story.id, chapter.id, content)
+    await _embed_records(db, story.user_id, created_chunks)
     story.pending_edit_notes = None  # duzenleme notlari bu uretimde kullanildi
     story.status = "COMPLETED"
     await db.commit()
@@ -173,17 +177,19 @@ async def _generate_chapter(db: AsyncSession, story_id: int, user_action: str | 
 
 
 async def _repair_missing_derivatives(db: AsyncSession, story: Story, ctx: LlmCtx) -> None:
-    """Onceki calismalarda uretilememis bolum ozetlerini + embedding'i NULL kalan olaylari
-    tamamlar (idempotent: her uretimde eksikler yeniden denenir). C2'den kalan veya yazim
-    aninda embedlenememis olaylar burada doldurulur. Basarisizlik uretimi engellemez.
-    NOT: chapters.embedding'e DOKUNULMAZ (Gemini uzayi; retrieval artik olay-embed'de)."""
+    """Onceki calismalarda uretilememis bolum ozetlerini + embedding'i NULL kalan olay VE
+    chunk'lari tamamlar (idempotent: her uretimde eksikler yeniden denenir). Yazim aninda
+    embedlenememis olay/chunk burada doldurulur. Basarisizlik uretimi engellemez.
+    NOT: chapters.embedding'e DOKUNULMAZ (Gemini uzayi; retrieval artik olay/chunk-embed'de).
+    Mevcut bolumler icin chunk URETIMI burada DEGIL, C4.4 backfill'inde yapilir (burasi yalnizca
+    var olan chunk kayitlarinin NULL embedding'ini doldurur)."""
     try:
         for chapter in story.chapters:
             if chapter.summary is None:
                 chapter.summary = await summarize_chapter(ctx, chapter.content)
 
         # embedding'i NULL kalan olaylari bul ve TEK batch cagriyla doldur (bounded)
-        pending = (
+        pending_events = (
             (
                 await db.execute(
                     select(Event)
@@ -194,7 +200,21 @@ async def _repair_missing_derivatives(db: AsyncSession, story: Story, ctx: LlmCt
             .scalars()
             .all()
         )
-        await _embed_events(db, story.user_id, pending)
+        await _embed_records(db, story.user_id, pending_events)
+
+        # embedding'i NULL kalan chunk'lari da doldur (yazimda embed patlamis olabilir; bounded)
+        pending_chunks = (
+            (
+                await db.execute(
+                    select(Chunk)
+                    .where(Chunk.story_id == story.id, Chunk.embedding.is_(None))
+                    .limit(EVENT_EMBED_BATCH)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        await _embed_records(db, story.user_id, pending_chunks)
     except embeddings.EmbedQuotaExceeded:
         logger.warning("Kullanici %s embed kotasi doldu; telafi ertelendi", story.user_id)
     except Exception:
@@ -236,7 +256,7 @@ async def apply_new_entities_from_edit(
     )
     _apply_entities(db, story, parsed, include_updates=False)
     created_events = _apply_events(db, story.id, chapter_id, parsed)
-    await _embed_events(db, story.user_id, created_events)
+    await _embed_records(db, story.user_id, created_events)
 
 
 async def _backfill_events(db: AsyncSession, story: Story, ctx: LlmCtx) -> None:
@@ -278,7 +298,7 @@ async def _backfill_events(db: AsyncSession, story: Story, ctx: LlmCtx) -> None:
                 reasoning=False,  # util isi: reasoning gereksiz + output olarak faturalanir
             )
             created = _apply_events(db, story.id, chap_id, parsed)
-            await _embed_events(db, story.user_id, created)
+            await _embed_records(db, story.user_id, created)
             await db.commit()
         except Exception:
             # Bu bolumun yarim kalan event'lerini geri al (attempts zaten commit'li);
@@ -396,27 +416,50 @@ def _apply_events(db: AsyncSession, story_id: int, chapter_id: int, parsed: dict
     return created
 
 
-async def _embed_events(db: AsyncSession, user_id: int, events: list[Event]) -> None:
-    """Verilen olaylari TEK embeddings cagrisiyla (batch) embedler. Kota bu yola baglidir
-    (embed_for_user -> consume_quota). Cagri patlarsa olaylar embedding'siz (NULL) kalir ve
-    uretim BLOKLANMAZ; sonraki telafi adiminda yeniden denenir.
+async def _embed_records(db: AsyncSession, user_id: int, records: list) -> None:
+    """Verilen kayitlari (Event veya Chunk; ikisi de .text + .embedding tasir) TEK embeddings
+    cagrisiyla (batch) embedler. Kota bu yola baglidir (embed_for_user -> consume_quota). Cagri
+    patlarsa kayitlar embedding'siz (NULL) kalir ve uretim BLOKLANMAZ; sonraki telafi adiminda
+    yeniden denenir.
 
-    Cagiranlar yalnizca embed'lenmesi gereken olaylari verir (yeni olusturulanlar ya da
-    'embedding IS NULL' ile sorgulanmis olaylar); burada e.embedding'e ERISME — deferred
-    kolon oldugu icin async'te lazy-load tetikleyip MissingGreenlet atar."""
-    pending = [e for e in events if (e.text or "").strip()]
+    Cagiranlar yalnizca embed'lenmesi gereken kayitlari verir (yeni olusturulanlar ya da
+    'embedding IS NULL' ile sorgulanmis olanlar); burada r.embedding'e ERISME — deferred kolon
+    oldugu icin async'te lazy-load tetikleyip MissingGreenlet atar."""
+    pending = [r for r in records if (r.text or "").strip()]
     if not pending:
         return
     try:
-        vectors = await embeddings.embed_for_user(db, user_id, [e.text for e in pending])
+        vectors = await embeddings.embed_for_user(db, user_id, [r.text for r in pending])
     except embeddings.EmbedQuotaExceeded:
-        logger.warning("Kullanici %s embed kotasi doldu; olaylar NULL embedding ile kaldi", user_id)
+        logger.warning("Kullanici %s embed kotasi doldu; kayitlar NULL embedding ile kaldi", user_id)
         return
     except Exception:
-        logger.warning("Olay embedleme basarisiz; olaylar NULL embedding ile kaydedildi", exc_info=True)
+        logger.warning("Embedleme basarisiz; kayitlar NULL embedding ile kaydedildi", exc_info=True)
         return
-    for event, vector in zip(pending, vectors):
-        event.embedding = vector
+    for record, vector in zip(pending, vectors):
+        record.embedding = vector
+
+
+async def _apply_chunks(db: AsyncSession, story_id: int, chapter_id: int, content: str) -> list[Chunk]:
+    """Bolumu deterministik olarak ~400-600 token'lik parcalara boler ve chunks tablosuna yazar.
+    IDEMPOTENT: bu bolumun ESKI chunk'larini once siler, sonra yenilerini ekler — duzenlemede
+    yetim chunk kalmaz, indeks tekrari olmaz. LLM YOK (split_into_chunks duz metin bolme).
+    embedding NULL baslar; cagiran _embed_records ile tek batch embedler."""
+    await db.execute(delete(Chunk).where(Chunk.chapter_id == chapter_id))
+    created: list[Chunk] = []
+    for i, text in enumerate(split_into_chunks(content)):
+        obj = Chunk(story_id=story_id, chapter_id=chapter_id, chunk_index=i, text=text)
+        db.add(obj)
+        created.append(obj)
+    return created
+
+
+async def rebuild_chapter_chunks(db: AsyncSession, story: Story, chapter_id: int, content: str) -> None:
+    """Bolum DUZENLENDIGINDE cagrilir: bolumun chunk'larini yeniden bolup embedler (idempotent).
+    LLM icermedigi icin entity/olay cikariminden (apply_new_entities_from_edit) BAGIMSIZ — biri
+    patlasa digeri calisir. Embed patlarsa chunk'lar NULL kalir, telafi doldurur."""
+    created = await _apply_chunks(db, story.id, chapter_id, content)
+    await _embed_records(db, story.user_id, created)
 
 
 def _excerpt(text: str) -> str:
