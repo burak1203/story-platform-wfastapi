@@ -66,10 +66,17 @@ async def update_element(
     db: AsyncSession = Depends(get_db),
 ):
     element = await _get_owned_element(kind, element_id, user, db)
-    name = request.name.strip()
+    name = request.name.strip()[:120]
     if not name:
         raise HTTPException(status_code=400, detail="İsim boş olamaz.")
-    element.name = name[:120]
+
+    # Yeniden adlandirma baska bir kayitla cakismasin (unique kisit 500 yerine temiz 409)
+    story = await db.get(Story, element.story_id)
+    siblings = getattr(story, kind)
+    if any(e.id != element.id and e.name.casefold() == name.casefold() for e in siblings):
+        raise HTTPException(status_code=409, detail=f"'{name}' zaten mevcut.")
+
+    element.name = name
     element.description = request.description.strip()
     await db.commit()
     return {"updated": element_id}
