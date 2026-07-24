@@ -1,0 +1,48 @@
+# Production stack: caddy (80/443) -> backend (kapali) -> postgres (kapali)
+# Kullanim: sunucuda .env.prod olustur (bkz. .env.prod.example), sonra:
+#   docker compose -f docker-compose.prod.yml up -d --build
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    env_file: .env.prod
+    environment:
+      POSTGRES_USER: kurgu_admin
+      POSTGRES_DB: kurgu_db
+      # POSTGRES_PASSWORD .env.prod'dan gelir
+    volumes:
+      # Dev compose'un "postgres_data" volume'uyla cakismamasi icin ayri isim
+      - postgres_data_prod:/var/lib/postgresql/data
+    # Port dogrudan DISARIYA ACILMAZ; yalnizca compose agi icinden erisilir
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kurgu_admin -d kurgu_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    env_file: .env.prod
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Port disariya acilmaz; yalnizca caddy uzerinden /api ile erisilir
+
+  caddy:
+    build: ./frontend
+    restart: unless-stopped
+    env_file: .env.prod  # SITE_ADDRESS buradan gelir
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - caddy_data:/data      # TLS sertifikalari (restart'ta yeniden alinmasin)
+      - caddy_config:/config
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data_prod:
+  caddy_data:
+  caddy_config:
