@@ -3,10 +3,12 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi.errors import RateLimitExceeded
 
 from .config import settings
 from .database import init_db
-from .routers import auth, elements, stories
+from .ratelimit import limiter, rate_limit_handler
+from .routers import auth, elements, llm, stories
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -18,6 +20,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="StoryPlatform API", lifespan=lifespan)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,6 +34,7 @@ app.add_middleware(
 app.include_router(auth.router)
 app.include_router(stories.router)
 app.include_router(elements.router)
+app.include_router(llm.router)
 
 
 @app.get("/api/health")
