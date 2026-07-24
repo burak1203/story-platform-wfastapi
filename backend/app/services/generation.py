@@ -2,7 +2,7 @@ import asyncio
 import logging
 
 from openai import RateLimitError
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..ai import client as ai
@@ -34,7 +34,8 @@ _background_tasks: set[asyncio.Task] = set()
 
 RETRIEVAL_MIN_CHAPTERS = 3  # bu kadar bolum birikmeden gecmis aramasi yapmaya gerek yok
 EXCERPT_CHARS = 1200
-EVENT_EMBED_BATCH = 128     # telafide tek seferde embedlenecek azami NULL olay sayisi
+EVENT_EMBED_BATCH = 128     # telafide tek seferde embedlenecek azami NULL olay/chunk sayisi
+ENTITY_EMBED_BATCH = 64     # telafide tur basina azami NULL entity karti sayisi
 EVENT_RETRIEVAL_LIMIT = 4   # sorguya en yakin kac olay cekilsin (chapter'a indirgenir)
 
 # Dinamik onem: RAG'le cekilen olayin importance'i AZALAN artisla yukselir, CEIL'i asmaz.
@@ -138,12 +139,14 @@ async def _generate_chapter(db: AsyncSession, story_id: int, user_action: str | 
     chapter = Chapter(story_id=story.id, index=next_index, content=content, summary=summary)
     db.add(chapter)
     await db.flush()  # olaylarin FK'si icin chapter.id gerekiyor
-    _apply_entities(db, story, parsed)
+    dirty_entities = _apply_entities(db, story, parsed)
     created_events = _apply_events(db, story.id, chapter.id, parsed)
     await _embed_records(db, story.user_id, created_events)  # tek batch; patlarsa NULL kalir
     # Chunk katmani: bolumu deterministik parcalara bolup embedle (LLM YOK). Ayri batch cagri.
     created_chunks = await _apply_chunks(db, story.id, chapter.id, content)
     await _embed_records(db, story.user_id, created_chunks)
+    # Entity kartlari: yalnizca YENI/DEGISEN olanlar (kullanimi D3'te). Degismeyen embedlenmez.
+    await _embed_entities(db, story.user_id, dirty_entities)
     story.pending_edit_notes = None  # duzenleme notlari bu uretimde kullanildi
     story.status = "COMPLETED"
     await db.commit()
@@ -215,6 +218,28 @@ async def _repair_missing_derivatives(db: AsyncSession, story: Story, ctx: LlmCt
             .all()
         )
         await _embed_records(db, story.user_id, pending_chunks)
+
+        # embedding'i NULL kalan entity kartlari (C4.2 oncesi olusanlar + embed'i patlayanlar).
+        # Uc tur TEK batch cagriya toplanir (kota: cagri basina). Aciklamasiz/durumsuz kartlar
+        # sorguda elenir: embed edilecek metinleri yok, LIMIT'i bosuna doldurmasinlar.
+        pending_entities: list = []
+        for model in (Character, Location, Item):
+            has_text = model.description != ""
+            if model is Character:
+                has_text = or_(has_text, Character.status.isnot(None))
+            rows = (
+                (
+                    await db.execute(
+                        select(model)
+                        .where(model.story_id == story.id, model.embedding.is_(None), has_text)
+                        .limit(ENTITY_EMBED_BATCH)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            pending_entities.extend(rows)
+        await _embed_entities(db, story.user_id, pending_entities)
     except embeddings.EmbedQuotaExceeded:
         logger.warning("Kullanici %s embed kotasi doldu; telafi ertelendi", story.user_id)
     except Exception:
@@ -254,9 +279,10 @@ async def apply_new_entities_from_edit(
         max_tokens=2048,
         reasoning=False,  # util isi: reasoning gereksiz + output olarak faturalanir
     )
-    _apply_entities(db, story, parsed, include_updates=False)
+    dirty_entities = _apply_entities(db, story, parsed, include_updates=False)
     created_events = _apply_events(db, story.id, chapter_id, parsed)
     await _embed_records(db, story.user_id, created_events)
+    await _embed_entities(db, story.user_id, dirty_entities)
 
 
 async def _backfill_events(db: AsyncSession, story: Story, ctx: LlmCtx) -> None:
@@ -329,24 +355,37 @@ def _clean_entries(raw, *fields: str) -> list[dict]:
     return cleaned
 
 
-def _apply_entities(db: AsyncSession, story: Story, parsed: dict, *, include_updates: bool = True) -> None:
+def _apply_entities(db: AsyncSession, story: Story, parsed: dict, *, include_updates: bool = True) -> list:
     """Cikarilan varliklari isimle upsert eder; ayni isim ikinci kez kaydedilmez.
     include_updates=False iken yalnizca YENI varliklar eklenir (updated_characters yok
     sayilir): bolum duzenleme yolunda mevcut karakterin durumu clobber'lanmasin ve
-    hicbir sey silinmesin diye."""
+    hicbir sey silinmesin diye.
+
+    Embed metni (description/status) DEGISEN veya yeni olusturulan entity'leri dondurur;
+    cagiran bunlari tek batch cagriyla embedler. Degismeyen entity yeniden embed EDILMEZ
+    (gereksiz cagri/kota harcanmasin)."""
     chars = {c.name.casefold(): c for c in story.characters}
     locs = {l.name.casefold(): l for l in story.locations}
     items = {i.name.casefold(): i for i in story.items}
+    dirty: dict[int, object] = {}  # id(obj) -> obj (ayni entity iki kez degisirse tek kez embed)
+
+    def touched(obj) -> None:
+        # Bayat vektoru gecersiz kil: yeniden embed patlarsa NULL kalir ve telafi yolu
+        # (embedding IS NULL taramasi) onu yakalar. Deferred kolona YAZMAK lazy-load tetiklemez.
+        obj.embedding = None
+        dirty[id(obj)] = obj
 
     for entry in _clean_entries(parsed.get("new_characters"), "description"):
         key = entry["name"].casefold()
         if key in chars:
             if entry["description"] and not chars[key].description:
                 chars[key].description = entry["description"]
+                touched(chars[key])
             continue
         obj = Character(story_id=story.id, name=entry["name"], description=entry["description"])
         db.add(obj)
         chars[key] = obj
+        touched(obj)
 
     if include_updates:
         for entry in _clean_entries(parsed.get("updated_characters"), "status_change"):
@@ -357,8 +396,10 @@ def _apply_entities(db: AsyncSession, story: Story, parsed: dict, *, include_upd
                 obj = Character(story_id=story.id, name=entry["name"], description="")
                 db.add(obj)
                 chars[key] = obj
-            if entry["status_change"]:
+                touched(obj)
+            if entry["status_change"] and entry["status_change"] != obj.status:
                 obj.status = entry["status_change"]
+                touched(obj)
 
     for entry in _clean_entries(parsed.get("new_locations"), "description"):
         key = entry["name"].casefold()
@@ -366,6 +407,7 @@ def _apply_entities(db: AsyncSession, story: Story, parsed: dict, *, include_upd
             obj = Location(story_id=story.id, name=entry["name"], description=entry["description"])
             db.add(obj)
             locs[key] = obj
+            touched(obj)
 
     for entry in _clean_entries(parsed.get("new_items"), "description"):
         key = entry["name"].casefold()
@@ -373,6 +415,9 @@ def _apply_entities(db: AsyncSession, story: Story, parsed: dict, *, include_upd
             obj = Item(story_id=story.id, name=entry["name"], description=entry["description"])
             db.add(obj)
             items[key] = obj
+            touched(obj)
+
+    return list(dirty.values())
 
 
 def _clean_events(raw) -> list[dict]:
@@ -416,28 +461,66 @@ def _apply_events(db: AsyncSession, story_id: int, chapter_id: int, parsed: dict
     return created
 
 
-async def _embed_records(db: AsyncSession, user_id: int, records: list) -> None:
-    """Verilen kayitlari (Event veya Chunk; ikisi de .text + .embedding tasir) TEK embeddings
-    cagrisiyla (batch) embedler. Kota bu yola baglidir (embed_for_user -> consume_quota). Cagri
-    patlarsa kayitlar embedding'siz (NULL) kalir ve uretim BLOKLANMAZ; sonraki telafi adiminda
-    yeniden denenir.
+def _record_text(record) -> str:
+    """Varsayilan metin cikarici: Event/Chunk icin .text."""
+    return record.text or ""
 
-    Cagiranlar yalnizca embed'lenmesi gereken kayitlari verir (yeni olusturulanlar ya da
-    'embedding IS NULL' ile sorgulanmis olanlar); burada r.embedding'e ERISME — deferred kolon
-    oldugu icin async'te lazy-load tetikleyip MissingGreenlet atar."""
-    pending = [r for r in records if (r.text or "").strip()]
+
+def entity_embed_text(entity) -> str:
+    """Entity kartinin embed metni: name + description (+ karakterde status). Kart SECIMI icin
+    (D3: hangi kartlar prompta girecek) — C4.2'de yalnizca doldurulur, kullanilmaz.
+
+    Isim DAHIL: isimler cogu zaman anlam tasir ("Sunfire Sword", "North Tower"); aciklama
+    zayifsa eslesmeyi isim kurtarir. NOT: isim degisirse embed metni de degisir, yani
+    yeniden embed edilir (update_element'teki karsilastirma bunu dogal olarak yakalar)."""
+    parts = [entity.name or "", entity.description or ""]
+    status = getattr(entity, "status", None)
+    if status:
+        parts.append(status)
+    return "\n".join(p for p in parts if p.strip()).strip()
+
+
+async def _embed_records(db: AsyncSession, user_id: int, records: list, text_of=_record_text) -> None:
+    """Verilen kayitlari TEK embeddings cagrisiyla (batch) embedler. Kota bu yola baglidir
+    (embed_for_user -> consume_quota). Cagri patlarsa kayitlar embedding'siz (NULL) kalir ve
+    uretim BLOKLANMAZ; sonraki telafi adiminda yeniden denenir.
+
+    text_of: kayittan embed metnini ureten callable. Varsayilan .text (Event/Chunk); entity'ler
+    icin entity_embed_text gecilir (alan adi .description (+ .status)). Boylece tek batch yolu
+    uc kayit turunu de tasir. Metni bos olanlar elenir (embed edilecek bir sey yok).
+
+    Cagiranlar yalnizca embed'lenmesi gereken kayitlari verir (yeni olusturulanlar, degisenler
+    ya da 'embedding IS NULL' ile sorgulanmis olanlar); burada r.embedding'i OKUMA — deferred
+    kolon oldugu icin async'te lazy-load tetikleyip MissingGreenlet atar (yazmak sorunsuz)."""
+    pending = [(r, t) for r in records if (t := text_of(r).strip())]
     if not pending:
         return
     try:
-        vectors = await embeddings.embed_for_user(db, user_id, [r.text for r in pending])
+        vectors = await embeddings.embed_for_user(db, user_id, [t for _, t in pending])
     except embeddings.EmbedQuotaExceeded:
         logger.warning("Kullanici %s embed kotasi doldu; kayitlar NULL embedding ile kaldi", user_id)
         return
     except Exception:
         logger.warning("Embedleme basarisiz; kayitlar NULL embedding ile kaydedildi", exc_info=True)
         return
-    for record, vector in zip(pending, vectors):
+    for (record, _), vector in zip(pending, vectors):
         record.embedding = vector
+
+
+async def _embed_entities(db: AsyncSession, user_id: int, entities: list) -> None:
+    """Karakter/mekan/esya kartlarini TEK batch cagriyla embedler (karisik liste verilebilir).
+    Bos aciklamali entity'ler _embed_records icinde elenir."""
+    await _embed_records(db, user_id, entities, text_of=entity_embed_text)
+
+
+async def embed_entities_safely(db: AsyncSession, user_id: int, entities: list) -> None:
+    """Router'lar icin (Studio'dan elle entity ekleme/duzenleme): entity embed'ini dener,
+    HICBIR durumda hata firlatmaz. Embed patlarsa entity NULL embedding ile kaydedilir ve
+    telafi yolu (bir sonraki uretimde NULL taramasi) doldurur — kullanicinin kaydi engellenmez."""
+    try:
+        await _embed_entities(db, user_id, entities)
+    except Exception:
+        logger.warning("Entity embed'i atlandi (kayit etkilenmedi)", exc_info=True)
 
 
 async def _apply_chunks(db: AsyncSession, story_id: int, chapter_id: int, content: str) -> list[Chunk]:

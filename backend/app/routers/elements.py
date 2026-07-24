@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -5,6 +7,9 @@ from ..database import get_db
 from ..models import Character, Item, Location, Story, User
 from ..schemas import CreateElementRequest, ElementRequest
 from ..security import get_current_user
+from ..services.generation import embed_entities_safely, entity_embed_text
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/elements", tags=["elements"])
 
@@ -40,6 +45,8 @@ async def create_element(
 
     element = model(story_id=story.id, name=name, description=request.description.strip())
     db.add(element)
+    # Kart embed'i (D3 kart secimi icin). Patlarsa NULL kalir, telafi yolu doldurur.
+    await embed_entities_safely(db, user.id, [element])
     await db.commit()
     return {"created": element.id}
 
@@ -76,8 +83,14 @@ async def update_element(
     if any(e.id != element.id and e.name.casefold() == name.casefold() for e in siblings):
         raise HTTPException(status_code=409, detail=f"'{name}' zaten mevcut.")
 
+    before = entity_embed_text(element)
     element.name = name
     element.description = request.description.strip()
+    # Embed metni (name/description/status) DEGISTIYSE yeniden embed et; degismediyse
+    # gereksiz cagri/kota harcama.
+    if entity_embed_text(element) != before:
+        element.embedding = None  # bayat vektoru gecersiz kil: embed patlarsa telafi yakalar
+        await embed_entities_safely(db, user.id, [element])
     await db.commit()
     return {"updated": element_id}
 

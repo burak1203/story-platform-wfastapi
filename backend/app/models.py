@@ -93,8 +93,9 @@ class Chapter(Base):
     content: Mapped[str] = mapped_column(Text)
     # Bolumun kendi kisa ozeti; tum ozetler sirayla birlesip hikayenin belini olusturur
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # deferred: bolum listesi cekilirken 768 float'lik vektorler bosuna yuklenmesin
-    embedding = mapped_column(Vector(settings.embedding_dim), nullable=True, deferred=True)
+    # NOT: eski `embedding` kolonu C4.2'de DUSURULDU. Icindeki vektorler GEMINI uzayindaydi;
+    # OpenAI sorgusuyla kiyaslanamiyordu ve yeni bolumlerde zaten NULL kaliyordu. Yerine
+    # bolum basina chunk katmani (chunks tablosu, OpenAI uzayi) gecti.
     # Olay sisteminden onceki bolumler icin lazy backfill deneme sayaci: sonsuz yeniden
     # deneme olmasin diye (MAX'a ulasinca o bolum backfill'de artik denenmez).
     backfill_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
@@ -168,9 +169,24 @@ class Chunk(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
+# Entity embed'leri (C4.2): description (+ karakterde status) birlestirilip embed'lenir.
+# KULLANIMI D3'te — hangi kartlarin prompta girecegine karar vermek (kart secimi) icin.
+# C4.2'de yalnizca DOLDURULUR; prompta hicbir sey degismez. Olay/chunk'larla AYNI uzayda
+# (OpenAI text-embedding-3-small, 768). NULLABLE: embed patlarsa entity yine kaydedilir,
+# telafi yolu NULL'lari doldurur.
+
+
 class Character(Base):
     __tablename__ = "characters"
-    __table_args__ = (UniqueConstraint("story_id", "name"),)
+    __table_args__ = (
+        UniqueConstraint("story_id", "name"),
+        Index(
+            "ix_characters_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     story_id: Mapped[int] = mapped_column(ForeignKey("stories.id", ondelete="CASCADE"), index=True)
@@ -178,23 +194,43 @@ class Character(Base):
     description: Mapped[str] = mapped_column(Text, default="")
     # Karakterin guncel durumu; her bolumde modelin bildirdigi degisimle guncellenir
     status: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # deferred: kart listesi cekilirken 768 float bosuna yuklenmesin
+    embedding = mapped_column(Vector(settings.embedding_dim), nullable=True, deferred=True)
 
 
 class Location(Base):
     __tablename__ = "locations"
-    __table_args__ = (UniqueConstraint("story_id", "name"),)
+    __table_args__ = (
+        UniqueConstraint("story_id", "name"),
+        Index(
+            "ix_locations_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     story_id: Mapped[int] = mapped_column(ForeignKey("stories.id", ondelete="CASCADE"), index=True)
     name: Mapped[str] = mapped_column(String(120))
     description: Mapped[str] = mapped_column(Text, default="")
+    embedding = mapped_column(Vector(settings.embedding_dim), nullable=True, deferred=True)
 
 
 class Item(Base):
     __tablename__ = "items"
-    __table_args__ = (UniqueConstraint("story_id", "name"),)
+    __table_args__ = (
+        UniqueConstraint("story_id", "name"),
+        Index(
+            "ix_items_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     story_id: Mapped[int] = mapped_column(ForeignKey("stories.id", ondelete="CASCADE"), index=True)
     name: Mapped[str] = mapped_column(String(120))
     description: Mapped[str] = mapped_column(Text, default="")
+    embedding = mapped_column(Vector(settings.embedding_dim), nullable=True, deferred=True)
