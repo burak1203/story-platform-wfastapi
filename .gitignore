@@ -13,3 +13,13 @@ ai-worker/__pycache__/
 .vscode/
 *.iml
 .DS_Store
+
+# Production sirlari
+.env.prod
+
+frontend/node_modules/*
+
+_
+
+CLAUDE.md
+DEPLOY.md
