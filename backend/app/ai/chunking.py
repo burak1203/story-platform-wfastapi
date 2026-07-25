@@ -21,8 +21,31 @@ CHUNK_MIN_TOKENS = 120
 _enc = tiktoken.get_encoding("cl100k_base")
 
 
-def _ntok(text: str) -> int:
+def count_tokens(text: str) -> int:
+    """Kaba token sayimi (cl100k_base). RAG token tavani ve chunk boyutu icin ortak olcu."""
     return len(_enc.encode(text))
+
+
+def _ntok(text: str) -> int:
+    return count_tokens(text)
+
+
+def tail_by_tokens(text: str, limit: int) -> str:
+    """Metnin SON `limit` token'i. Sorgu zenginlestirmede kullanilir: kisa bir hamlenin
+    ("iceri giriyorum") vektoru hicbir seye benzemez; son bolumun kuyrugu mevcut sahne
+    baglamini tasir."""
+    tokens = _enc.encode(text or "")
+    if len(tokens) <= limit:
+        return (text or "").strip()
+    return _enc.decode(tokens[-limit:]).strip()
+
+
+def truncate_by_tokens(text: str, limit: int) -> str:
+    """Metni ILK `limit` token'a kirpar (RAG token tavani icin son care)."""
+    tokens = _enc.encode(text or "")
+    if len(tokens) <= limit:
+        return text or ""
+    return _enc.decode(tokens[:limit]).rstrip() + "..."
 
 
 def _split_sentences(text: str) -> list[str]:
@@ -47,23 +70,38 @@ def _hard_split_by_tokens(text: str, max_tokens: int) -> list[str]:
     return chunks
 
 
-def _atomic_units(text: str) -> list[str]:
+def _atomic_units(text: str) -> list[tuple[str, str]]:
     """Birlestirilebilir en kucuk parcalar: once paragraf; MAX'i asiyorsa cumle; o da asiyorsa
-    token penceresi. Boylece hicbir unit tek basina CHUNK_MAX_TOKENS'i asmaz."""
-    units: list[str] = []
+    token penceresi. Boylece hicbir unit tek basina CHUNK_MAX_TOKENS'i asmaz.
+
+    Her unit (metin, ONCESINDEKI ayirac) doner: paragraf sinirinda "\\n\\n", ayni paragraf
+    icinde bolunmus cumleler arasinda " ". Boylece chunk metni ORIJINALIN bicimini korur —
+    paragrafsiz bir bolumu cumle cumle "\\n\\n" ile yeniden yazmaz."""
+    units: list[tuple[str, str]] = []
     for para in re.split(r"\n\s*\n", text.strip()):
         para = para.strip()
         if not para:
             continue
         if _ntok(para) <= CHUNK_MAX_TOKENS:
-            units.append(para)
+            units.append((para, "\n\n"))
             continue
+        # Paragraf cok buyuk: cumlelere bol. ILK parca paragraf sinirinda, sonrakiler
+        # ayni paragrafin icinde -> aralarinda bosluk kullanilir.
+        first = True
         for sent in _split_sentences(para):
-            if _ntok(sent) <= CHUNK_MAX_TOKENS:
-                units.append(sent)
-            else:
-                units.extend(_hard_split_by_tokens(sent, CHUNK_MAX_TOKENS))
+            pieces = [sent] if _ntok(sent) <= CHUNK_MAX_TOKENS else _hard_split_by_tokens(sent, CHUNK_MAX_TOKENS)
+            for piece in pieces:
+                units.append((piece, "\n\n" if first else " "))
+                first = False
     return units
+
+
+def _join_units(units: list[tuple[str, str]]) -> str:
+    """Unit'leri kendi ayiraclariyla birlestirir (ilk unit'in ayiraci yok sayilir)."""
+    out = units[0][0]
+    for text, sep in units[1:]:
+        out += sep + text
+    return out
 
 
 def split_into_chunks(text: str) -> list[str]:
@@ -74,28 +112,30 @@ def split_into_chunks(text: str) -> list[str]:
         return []
 
     units = _atomic_units(text)
+    if not units:
+        return []
     chunks: list[str] = []
-    cur_units: list[str] = []
+    cur_units: list[tuple[str, str]] = []
     cur_tokens = 0
 
     for unit in units:
-        ut = _ntok(unit)
+        ut = _ntok(unit[0])
         # Mevcut parca doluysa ve bu unit onu MAX'in ustune tasiyacaksa once flush et
         if cur_units and cur_tokens + ut > CHUNK_MAX_TOKENS:
-            chunks.append("\n\n".join(cur_units))
+            chunks.append(_join_units(cur_units))
             cur_units, cur_tokens = [], 0
         cur_units.append(unit)
         cur_tokens += ut
         # Hedefe ulastiysa kapat (parcalar ~TARGET civari kalsin)
         if cur_tokens >= CHUNK_TARGET_TOKENS:
-            chunks.append("\n\n".join(cur_units))
+            chunks.append(_join_units(cur_units))
             cur_units, cur_tokens = [], 0
 
     if cur_units:
-        tail = "\n\n".join(cur_units)
+        tail = _join_units(cur_units)
         # Cok kucuk son parca tek basina zayif vektor uretir -> oncekiyle birlestir
         if chunks and cur_tokens < CHUNK_MIN_TOKENS:
-            chunks[-1] = chunks[-1] + "\n\n" + tail
+            chunks[-1] = chunks[-1] + cur_units[0][1] + tail
         else:
             chunks.append(tail)
 

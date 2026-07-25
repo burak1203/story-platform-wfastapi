@@ -29,11 +29,18 @@ from ..ratelimit import GENERATION_LIMIT, SEARCH_LIMIT, limiter
 from ..security import get_current_user, get_llm_ctx
 from ..services.generation import (
     apply_new_entities_from_edit,
-    find_relevant_events,
     rebuild_chapter_chunks,
     schedule_generation,
-    story_has_embedded_events,
     summarize_chapter,
+)
+from ..services.retrieval import (
+    block_text,
+    embed_query,
+    expand_and_merge_chunks,
+    find_relevant_chunks,
+    find_relevant_events,
+    story_has_embedded_chunks,
+    story_has_embedded_events,
 )
 from ..services.sse import broker
 
@@ -247,32 +254,45 @@ async def edit_chapter_summary(
     return story_detail(story)
 
 
-def _chapter_window(chapter_map: dict[int, object], index: int) -> list[SearchWindowChapter]:
-    """Bir bolumun n-1/n/n+1 penceresini (mevcut olanlarla) kurar."""
-    return [
-        SearchWindowChapter(index=i, excerpt=chapter_map[i].content[:1200])
-        for i in (index - 1, index, index + 1)
-        if i in chapter_map
-    ]
+SEARCH_EXCERPT_CHARS = 1200  # geri dusus yollarinda gosterilen alinti uzunlugu
 
 
-def _keyword_search(story: Story, query: str, chapter_map: dict[int, object]) -> list[SearchHit]:
-    """Olay-embed yoksa (eski hikaye / backfill oncesi) vektorsuz fallback: sorgu kelimelerini
-    iceren bolumleri dondurur. Vektor uzayi karismaz; hicbir esdeger yoksa gercekten bos doner.
-    distance=-1.0 = 'anahtar-kelime fallback, vektor mesafesi yok' isareti."""
+def _excerpt_around(text: str, pos: int, span: int = SEARCH_EXCERPT_CHARS) -> str:
+    """Eslesmenin ETRAFINDAN alinti (bolum BASINDAN degil): sahne bolumun sonundaysa bas
+    alintida hic gorunmuyordu. Kirpilan taraflar '...' ile isaretlenir."""
+    start = max(0, pos - span // 2)
+    end = min(len(text), start + span)
+    prefix = "..." if start > 0 else ""
+    suffix = "..." if end < len(text) else ""
+    return prefix + text[start:end].strip() + suffix
+
+
+def _keyword_search(story: Story, query: str) -> list[SearchHit]:
+    """Ne chunk ne olay embed'i varsa (cok eski hikaye / backfill oncesi) vektorsuz fallback:
+    sorgu kelimelerini iceren bolumleri dondurur. Vektor uzayi karismaz; hicbir esdeger yoksa
+    gercekten bos doner. distance=-1.0 = 'anahtar-kelime fallback, vektor mesafesi yok' isareti.
+    Alinti ILK eslesmenin etrafindan alinir."""
     terms = [t for t in query.lower().split() if len(t) >= 3]
     if not terms:
         return []
-    scored: list[tuple[int, int]] = []
+    scored: list[tuple[int, int, int]] = []  # (skor, bolum indeksi, ilk eslesme konumu)
     for chapter in story.chapters:
         text = chapter.content.lower()
         score = sum(text.count(t) for t in terms)
         if score > 0:
-            scored.append((score, chapter.index))
+            positions = [p for p in (text.find(t) for t in terms) if p >= 0]
+            scored.append((score, chapter.index, min(positions) if positions else 0))
     scored.sort(key=lambda x: (-x[0], x[1]))
+    chapter_map = {c.index: c for c in story.chapters}
     return [
-        SearchHit(chapter_index=index, distance=-1.0, window=_chapter_window(chapter_map, index))
-        for _, index in scored[:3]
+        SearchHit(
+            chapter_index=index,
+            distance=-1.0,
+            window=[
+                SearchWindowChapter(index=index, excerpt=_excerpt_around(chapter_map[index].content, pos))
+            ],
+        )
+        for _, index, pos in scored[:3]
     ]
 
 
@@ -293,33 +313,62 @@ async def search_story(
     if not story.chapters:
         return []
 
-    chapter_map = {c.index: c for c in story.chapters}
     id_to_index = {c.id: c.index for c in story.chapters}
 
-    # Olay-embed varsa birincil yol: olay -> chapter_id -> distinct bolum (en iyi mesafe) -> pencere.
-    # Olay yoksa vektor uzayi karistirmamak icin anahtar-kelime fallback'ine dus.
-    if not await story_has_embedded_events(db, story.id):
-        return _keyword_search(story, query, chapter_map)
+    # Yol sirasi: chunk (birincil, en iyi kapsama) -> olay -> anahtar-kelime. Chunk'i olmayan
+    # hikaye (C4.4 backfill oncesi) olay yoluna, ikisi de yoksa vektorsuz fallback'e duser.
+    has_chunks = await story_has_embedded_chunks(db, story.id)
+    has_events = await story_has_embedded_events(db, story.id)
+    if not has_chunks and not has_events:
+        return _keyword_search(story, query)
 
     try:
-        hits = await find_relevant_events(db, story, query, bump=False)
+        query_vec = await embed_query(db, story, query)
     except embeddings.EmbedQuotaExceeded:
         raise HTTPException(
             status_code=429, detail="Günlük arama/embed kotan doldu, yarın tekrar dene."
         )
 
-    best: dict[int, float] = {}  # bolum indeksi -> en kucuk (en yakin) mesafe
-    for event, distance in hits:
-        index = id_to_index.get(event.chapter_id)
-        if index is None:
-            continue
-        if index not in best or distance < best[index]:
-            best[index] = distance
+    if has_chunks:
+        # Aramada son N bolum HARIC TUTULMAZ: kullanici tum hikayede ariyor (uretimdeki
+        # disleme, o bolumlerin prompta zaten tam metin girmesinden kaynaklaniyordu).
+        hits = await find_relevant_chunks(db, story, query_vec)
+        blocks = await expand_and_merge_chunks(db, story, hits)
+        by_chapter: dict[int, list[dict]] = {}
+        for block in blocks:
+            by_chapter.setdefault(block["chapter_index"], []).append(block)
+        results = [
+            SearchHit(
+                chapter_index=index,
+                distance=min(b["score"] for b in chapter_blocks),
+                # Pencere artik bolum basindan degil, eslesen chunk'larin ETRAFINDAN
+                window=[
+                    SearchWindowChapter(index=index, excerpt=block_text(b))
+                    for b in sorted(chapter_blocks, key=lambda b: b["start"])
+                ],
+            )
+            for index, chapter_blocks in by_chapter.items()
+        ]
+        results.sort(key=lambda h: h.distance)
+        return results
 
-    return [
-        SearchHit(chapter_index=index, distance=best[index], window=_chapter_window(chapter_map, index))
-        for index in sorted(best, key=lambda i: best[i])
+    # Chunk yok, olay var: pencere olarak olayin KENDI metni (kendi basina anlasilir yazilir)
+    event_hits = await find_relevant_events(db, story, query_vec, bump=False)
+    by_index: dict[int, list[tuple[float, str]]] = {}
+    for event, distance in event_hits:
+        index = id_to_index.get(event.chapter_id)
+        if index is not None:
+            by_index.setdefault(index, []).append((distance, event.text))
+    results = [
+        SearchHit(
+            chapter_index=index,
+            distance=min(d for d, _ in entries),
+            window=[SearchWindowChapter(index=index, excerpt=text) for _, text in entries],
+        )
+        for index, entries in by_index.items()
     ]
+    results.sort(key=lambda h: h.distance)
+    return results
 
 
 @router.get("/{story_id}/stream")

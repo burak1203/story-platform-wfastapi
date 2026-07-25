@@ -125,7 +125,9 @@ class SearchWindowChapter(CamelModel):
 class SearchHit(CamelModel):
     chapter_index: int
     distance: float
-    # n-1 / n / n+1 penceresi: eslesen bolum ve komsulari, sirali
+    # Eslesen bolumun sahne pencereleri (chunk yolunda: eslesen chunk'in ETRAFINDAKI birlesik
+    # bloklar, chunk sirasinda; olay yolunda: eslesen olay metinleri). Her ogenin index'i
+    # eslesen bolumun indeksidir. Eski "bolum n-1/n/n+1 basindan alinti" mantigi kalkti.
     window: list[SearchWindowChapter]
 
 

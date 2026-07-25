@@ -19,6 +19,7 @@ from ..ai.prompts import (
 from ..database import SessionLocal
 from ..models import Chapter, Character, Chunk, Event, Item, Location, Story
 from ..schemas import story_detail
+from .retrieval import retrieve_context_block
 from .sse import broker
 
 logger = logging.getLogger(__name__)
@@ -33,16 +34,8 @@ _lock_refcount: dict[int, int] = {}
 _background_tasks: set[asyncio.Task] = set()
 
 RETRIEVAL_MIN_CHAPTERS = 3  # bu kadar bolum birikmeden gecmis aramasi yapmaya gerek yok
-EXCERPT_CHARS = 1200
 EVENT_EMBED_BATCH = 128     # telafide tek seferde embedlenecek azami NULL olay/chunk sayisi
 ENTITY_EMBED_BATCH = 64     # telafide tur basina azami NULL entity karti sayisi
-EVENT_RETRIEVAL_LIMIT = 4   # sorguya en yakin kac olay cekilsin (chapter'a indirgenir)
-
-# Dinamik onem: RAG'le cekilen olayin importance'i AZALAN artisla yukselir, CEIL'i asmaz.
-# Formul: new = old + (CEIL - old) * GROWTH  -> her cekilis daha az ekler, hicbir sey 1.0'a
-# kosmaz; boylece "cok onemli" ile digerleri arasindaki ayrim korunur.
-IMPORTANCE_CEIL = 0.95
-IMPORTANCE_GROWTH = 0.2
 
 # Lazy backfill (olay sisteminden onceki bolumler): her uretimde EN FAZLA bu kadar eski
 # bolum islenir (kullanici yeni bolum uretirken 50 bolumluk backfill beklemesin), en yeni
@@ -115,7 +108,7 @@ async def _generate_chapter(db: AsyncSession, story_id: int, user_action: str | 
     retrieved_block = None
     if not is_first and user_action and len(story.chapters) >= RETRIEVAL_MIN_CHAPTERS:
         try:
-            retrieved_block = await _retrieve_relevant_block(db, story, user_action)
+            retrieved_block = await retrieve_context_block(db, story, user_action)
         except Exception:
             logger.warning("Gecmis bolum aramasi atlandi", exc_info=True)
 
@@ -545,67 +538,6 @@ async def rebuild_chapter_chunks(db: AsyncSession, story: Story, chapter_id: int
     await _embed_records(db, story.user_id, created)
 
 
-def _excerpt(text: str) -> str:
-    return text[:EXCERPT_CHARS] + ("..." if len(text) > EXCERPT_CHARS else "")
-
-
-async def story_has_embedded_events(db: AsyncSession, story_id: int) -> bool:
-    """Hikayede embed'lenmis en az bir olay var mi? (Sorguyu bosuna embedlememek /
-    kotayi harcamamak icin retrieval'dan once ucuz kontrol.)"""
-    stmt = select(Event.id).where(Event.story_id == story_id, Event.embedding.isnot(None)).limit(1)
-    return (await db.execute(stmt)).first() is not None
-
-
-async def find_relevant_events(
-    db: AsyncSession, story: Story, query: str, limit: int = EVENT_RETRIEVAL_LIMIT, *, bump: bool = False
-) -> list[tuple[Event, float]]:
-    """Sorguya anlamca en yakin olaylari (Event, distance) dondurur — OpenAI uzayinda cosine.
-    Yalnizca embedding'i dolu olaylar aranir (Gemini chapters.embedding'e ASLA dokunulmaz).
-    bump=True ise eslesen olaylarin importance'i (azalan artis, CEIL sinirli) ve
-    retrieved_count'u yukselir (dinamik onem — olay gercekten baglama cekildiginde)."""
-    query_vec = (await embeddings.embed_for_user(db, story.user_id, [query]))[0]
-    stmt = (
-        select(Event, Event.embedding.cosine_distance(query_vec).label("dist"))
-        .where(Event.story_id == story.id, Event.embedding.isnot(None))
-        .order_by("dist")
-        .limit(limit)
-    )
-    rows = (await db.execute(stmt)).all()
-    hits: list[tuple[Event, float]] = []
-    for event, dist in rows:
-        hits.append((event, float(dist)))
-        if bump:
-            event.importance = min(
-                IMPORTANCE_CEIL, event.importance + (IMPORTANCE_CEIL - event.importance) * IMPORTANCE_GROWTH
-            )
-            event.retrieved_count += 1
-    return hits
-
-
-async def _retrieve_relevant_block(db: AsyncSession, story: Story, query: str) -> str | None:
-    """Olay->chapter->pencere: eslesen olaylarin bolumlerini n-1/n/n+1 komsulariyla alintiler.
-    Olayi olmayan hikayede None doner (RAG blogu atlanir; uretim ozet+son2+entity ile devam eder)."""
-    if not await story_has_embedded_events(db, story.id):
-        return None
-    hits = await find_relevant_events(db, story, query, bump=True)
-    if not hits:
-        return None
-
-    # Son iki bolum zaten prompta tam metin olarak giriyor; aramaya dahil etme
-    cutoff = story.chapters[-1].index - 1 if len(story.chapters) >= 2 else story.chapters[-1].index
-    id_to_index = {c.id: c.index for c in story.chapters}
-
-    wanted: set[int] = set()
-    for event, _ in hits:
-        index = id_to_index.get(event.chapter_id)
-        if index is not None:
-            wanted.update({index - 1, index, index + 1})
-    wanted = {i for i in wanted if 1 <= i < cutoff}
-
-    chapter_map = {c.index: c for c in story.chapters}
-    blocks = [
-        f"--- Chapter {i} ---\n{_excerpt(chapter_map[i].content)}"
-        for i in sorted(wanted)
-        if i in chapter_map
-    ]
-    return "\n\n".join(blocks) if blocks else None
+# NOT: RAG OKUMA yolu (chunk arama, ±1 penceresi, birlestirme, token tavani, olay blogu)
+# services/retrieval.py'ye tasindi. Bu dosya YAZMA yolunda kaldi (chunk/olay/entity uretimi).
+# Eski bolum bazli n±1 penceresi ve content[:1200] (bolum BASINDAN alinti) mantigi KALDIRILDI.
