@@ -22,7 +22,13 @@ from ..ai.prompts import (
 from ..database import SessionLocal
 from ..models import Chapter, Character, Chunk, Event, Item, Location, Story
 from ..schemas import story_detail
-from .retrieval import RetrievalResult, build_pinned_block, retrieve_context_block
+from .retrieval import (
+    RetrievalResult,
+    build_pinned_block,
+    load_core_names,
+    retrieve_context_block,
+    select_entity_cards,
+)
 from .rollup import ensure_rollup
 from .sse import broker
 
@@ -121,15 +127,24 @@ async def _generate_chapter(db: AsyncSession, story_id: int, user_action: str | 
         except Exception:
             logger.warning("Gecmis bolum aramasi atlandi", exc_info=True)
 
-    # Pinned cekirdek: SORGUDAN BAGIMSIZ, RAG bos donse bile gider. RAG'le gelen olaylar elenir.
+    # Pinned cekirdek + entity karti secimi. Ikisi de AYNI cekirdek isim listesini kullanir
+    # (tek sorgu). Patlarsa uretim durmaz: pinned/kart bloklari bos gecer.
     pinned_block = None
+    core_cards: dict[str, list] | None = None
+    scene_cards: dict[str, list] | None = None
     if not is_first:
         try:
-            pinned_block = await build_pinned_block(db, story, retrieval.event_ids)
+            core_names = await load_core_names(db, story)
+            pinned_block = await build_pinned_block(db, story, retrieval.event_ids, core_names)
+            core_cards, scene_cards = await select_entity_cards(
+                db, story, user_action, retrieval, core_names
+            )
         except Exception:
-            logger.warning("Pinned cekirdek atlandi", exc_info=True)
+            logger.warning("Pinned cekirdek / entity karti secimi atlandi", exc_info=True)
 
-    sections = build_chapter_prompt_sections(story, retrieval.block, pinned_block)
+    sections = build_chapter_prompt_sections(
+        story, retrieval.block, pinned_block, core_cards=core_cards, scene_cards=scene_cards
+    )
     system_prompt = join_sections(sections)
     # Kullanicinin hamlesi USER mesajinda (cache-dostu: sistem promptu sabit prefix, hamle degisken)
     user_message = (

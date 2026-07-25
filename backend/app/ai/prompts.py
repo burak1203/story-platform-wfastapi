@@ -153,6 +153,47 @@ def _entity_lines(entities, with_status: bool = False, desc_limit: int = 200) ->
     return "\n".join(lines) if lines else "(none yet)"
 
 
+def _entity_roster(story: Story) -> str:
+    """TUM entity'lerin yalnizca ISIMLERI (~3 token/isim). Her uretimde gider: modelin
+    "bu isim zaten var" bilmesi, ayni karakteri ikinci kez yaratip cift kayit acmamasi icin.
+    Append-only buyudugu icin cache-dostudur."""
+
+    def names(entities) -> str:
+        listed = [e.name for e in entities if (e.name or "").strip()]
+        return ", ".join(listed) if listed else "(none yet)"
+
+    return (
+        "These already exist. Refer to them by these exact names; never create a second entry "
+        "for a name listed here.\n"
+        f"Characters: {names(story.characters)}\n"
+        f"Locations: {names(story.locations)}\n"
+        f"Items: {names(story.items)}"
+    )
+
+
+def entity_card_tokens(entity) -> int:
+    """Bir entity kartinin PROMPTA GIRECEGI HALIYLE token maliyeti. Secim tarafi (retrieval)
+    butceyi bununla olcer — kartin nasil bicimlendigini tek yerde tutmak icin (yoksa butce
+    sessizce asilir)."""
+    from .chunking import count_tokens
+
+    return count_tokens(_entity_lines([entity], with_status=hasattr(entity, "status")))
+
+
+def _cards_block(cards: dict[str, list] | None) -> str | None:
+    """Secilmis entity'lerin TAM kartlari. Bos turler basliksiz atlanir."""
+    if not cards:
+        return None
+    parts = []
+    if cards.get("characters"):
+        parts.append(f"Characters:\n{_entity_lines(cards['characters'], with_status=True)}")
+    if cards.get("locations"):
+        parts.append(f"Locations:\n{_entity_lines(cards['locations'])}")
+    if cards.get("items"):
+        parts.append(f"Items:\n{_entity_lines(cards['items'])}")
+    return "\n\n".join(parts) if parts else None
+
+
 def plan_rollup(last_index: int) -> dict:
     """D2 rollup plani — YALNIZCA bolum indekslerinden, DETERMINISTIK olarak hesaplanir.
 
@@ -235,10 +276,15 @@ def build_chapter_prompt_sections(
     retrieved_block: str | None,
     pinned_block: str | None = None,
     genres: list[str] | None = None,
+    core_cards: dict[str, list] | None = None,
+    scene_cards: dict[str, list] | None = None,
 ) -> list[tuple[str, str]]:
     """Sistem promptunu (bilesen_anahtari, metin) ciftleri olarak kurar. Anahtarlar token
     KIRILIMI icin (D3): hangi bolum ne kadar token yiyor. Sira cache-dostudur — bkz. modul
-    docstring'i: sabit -> buyuyen -> yavas -> cache-kirici."""
+    docstring'i: sabit -> buyuyen -> yavas -> cache-kirici.
+
+    Entity'ler (D3.2) UC parcaya ayrilir: isim listesi (her zaman, erken) + cekirdek kartlar
+    (erken, nadiren degisir) + sahneye ozel kartlar (gec, RAG yaninda, her bolumde degisir)."""
     is_continuation = bool(story.chapters)
     sections: list[tuple[str, str]] = []
 
@@ -265,13 +311,13 @@ def build_chapter_prompt_sections(
 
     # ===== 3. SLOW VARIABLES (change occasionally) =====
     if is_continuation:
-        sections.append((
-            "entities",
-            "[KNOWN UNIVERSE]\n"
-            f"Characters:\n{_entity_lines(story.characters, with_status=True)}\n\n"
-            f"Locations:\n{_entity_lines(story.locations)}\n\n"
-            f"Items:\n{_entity_lines(story.items)}",
-        ))
+        # Name roster: ALWAYS sent, ~3 tokens per name. It is what stops the model from
+        # inventing a second entry for someone who already exists. Append-only -> cache-friendly.
+        sections.append(("entities", "[KNOWN UNIVERSE - NAME ROSTER]\n" + _entity_roster(story)))
+        # Core characters: full profiles, early and stable (they rarely change between chapters).
+        core_block = _cards_block(core_cards)
+        if core_block:
+            sections.append(("entities", "[CORE CHARACTERS - FULL PROFILES]\n" + core_block))
     if pinned_block:
         sections.append(("pinned", "[PINNED KEY EVENTS - ALWAYS RELEVANT]\n" + pinned_block))
 
@@ -287,6 +333,14 @@ def build_chapter_prompt_sections(
         sections.append((
             "last_chapters",
             f"[LAST CHAPTER (Chapter {last.index}) - FULL TEXT]\n{_tail(last.content, LAST_CHAPTER_CAP)}",
+        ))
+    # Scene-specific cards sit HERE (late, next to the RAG block): they change every chapter,
+    # so keeping them out of the early region protects the cached prefix.
+    scene_block = _cards_block(scene_cards)
+    if scene_block:
+        sections.append((
+            "scene_entities",
+            "[ENTITIES RELEVANT TO THIS SCENE - FULL PROFILES]\n" + scene_block,
         ))
     if retrieved_block:
         sections.append((
@@ -316,10 +370,16 @@ def build_chapter_system_prompt(
     retrieved_block: str | None,
     pinned_block: str | None = None,
     genres: list[str] | None = None,
+    core_cards: dict[str, list] | None = None,
+    scene_cards: dict[str, list] | None = None,
 ) -> str:
     """Single template for both the first chapter and continuations. Components are ordered
     slowest-changing first for provider prefix caching (see module docstring)."""
-    return join_sections(build_chapter_prompt_sections(story, retrieved_block, pinned_block, genres))
+    return join_sections(
+        build_chapter_prompt_sections(
+            story, retrieved_block, pinned_block, genres, core_cards, scene_cards
+        )
+    )
 
 
 def token_breakdown(sections: list[tuple[str, str]], user_message: str) -> dict[str, int]:

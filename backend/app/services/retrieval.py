@@ -16,6 +16,7 @@ bolumun sonundaysa bas alintida hic gorunmuyordu.
 """
 
 import logging
+import re
 from dataclasses import dataclass, field
 
 from sqlalchemy import select
@@ -23,7 +24,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..ai import embeddings
 from ..ai.chunking import count_tokens, tail_by_tokens, truncate_by_tokens
-from ..models import Chunk, Event, Story
+from ..ai.prompts import entity_card_tokens
+from ..models import Character, Chunk, Event, Item, Location, Story
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +51,15 @@ PINNED_CORE_ENTITIES = 3   # kac karakter "cekirdek" (protagonist/cok gecen) say
 PINNED_CANDIDATE_POOL = 60  # importance'a gore cekilen aday olay sayisi (bellekte elenir)
 
 
+# Entity karti secimi (D3.2): TUM kartlari her bolumde gondermek baglamin en buyuk israfi.
+# Her zaman yalnizca ISIM listesi gider (model "bu isim zaten var" bilsin); TAM kartlar
+# sahneye alakali olanlar icin.
+SCENE_CARD_TOKEN_BUDGET = 800
+SCENE_CARD_MAX = 12
+SCENE_SEMANTIC_TOP = 4     # embed'le (anlamca) secilecek ek entity sayisi
+NAME_PART_MIN = 3          # ismin ilk parcasi bu uzunluktaysa tek basina da aranir
+
+
 @dataclass
 class RetrievalResult:
     """RAG cikti paketi. Sadece metin degil, prompta NELERIN girdigi de doner:
@@ -59,6 +70,9 @@ class RetrievalResult:
     event_ids: set[int] = field(default_factory=set)
     scene_chapter_ids: set[int] = field(default_factory=set)
     texts: list[str] = field(default_factory=list)
+    # Sorgu vektoru: entity karti seciminde ANLAMSAL yakinlik icin yeniden kullanilir
+    # (ikinci kez embed etmek ayni metin icin bir cagri + bir kota birimi daha harcardi).
+    query_vec: list[float] | None = None
 
 
 def build_retrieval_query(story: Story, user_action: str) -> str:
@@ -314,7 +328,10 @@ def core_entity_names(story: Story, events: list[Event], limit: int = PINNED_COR
 
 
 async def build_pinned_block(
-    db: AsyncSession, story: Story, exclude_event_ids: set[int] | None = None
+    db: AsyncSession,
+    story: Story,
+    exclude_event_ids: set[int] | None = None,
+    core_names: list[str] | None = None,
 ) -> str | None:
     """Pinned cekirdek: SORGUDAN BAGIMSIZ, her uretimde giden olaylar. Iki kaynak birlesir:
       1. En yuksek importance'li olaylar (hikayenin donum noktalari),
@@ -344,7 +361,7 @@ async def build_pinned_block(
     if not candidates:
         return None
 
-    core = [n.casefold() for n in core_entity_names(story, rows)]
+    core = [n.casefold() for n in (core_names if core_names is not None else core_entity_names(story, rows))]
     # Cekirdek karaktere dokunan olaylar one alinir; esitlikte importance belirler.
     def rank(event: Event) -> tuple[int, float]:
         touches_core = any(n in (event.text or "").casefold() for n in core)
@@ -368,6 +385,144 @@ async def build_pinned_block(
     # Kronolojik okunsun (prompt icinde zaman akisi bozulmasin)
     lines.sort(key=lambda l: int(l.split()[2].rstrip(":")) if l.split()[2].rstrip(":").isdigit() else 0)
     return "\n".join(lines)
+
+
+def name_regex(name: str) -> re.Pattern | None:
+    """Bir entity ismini KELIME SINIRINA saygili arayan desen. Duz substring aramasi yanlis
+    eslesir: "Ryu" -> "Ryuk" icinde bulunurdu. Tam isim VEYA ismin ILK parcasi (>=3 harf)
+    aranir — soyad/lakap parcalari tek basina aranmaz (ortak soyadlar tum aileyi cekerdi)."""
+    name = (name or "").strip()
+    if not name:
+        return None
+    variants = {name}
+    first = name.split()[0]
+    if len(first) >= NAME_PART_MIN:
+        variants.add(first)
+    pattern = "|".join(re.escape(v) for v in sorted(variants, key=len, reverse=True))
+    return re.compile(rf"(?<!\w)(?:{pattern})(?!\w)", re.IGNORECASE | re.UNICODE)
+
+
+def _mentioned_in(entities: list, haystacks: list[str]) -> set[int]:
+    """Verilen metinlerde adi GECEN entity'lerin id kumesi."""
+    blob = "\n".join(h for h in haystacks if h)
+    if not blob:
+        return set()
+    found: set[int] = set()
+    for entity in entities:
+        pattern = name_regex(entity.name)
+        if pattern and pattern.search(blob):
+            found.add(entity.id)
+    return found
+
+
+async def _semantically_close_entities(
+    db: AsyncSession, story_id: int, query_vec: list[float], limit: int
+) -> list[tuple[object, float]]:
+    """C4.2'de doldurulan entity embed'leriyle sorguya anlamca en yakin kartlar. Adi hic
+    gecmese de sahneyle ilgili olani yakalar ("kilic" hamlesi -> 'Sunfire Sword' karti)."""
+    hits: list[tuple[object, float]] = []
+    for model in (Character, Location, Item):
+        rows = (
+            await db.execute(
+                select(model, model.embedding.cosine_distance(query_vec).label("dist"))
+                .where(model.story_id == story_id, model.embedding.isnot(None))
+                .order_by("dist")
+                .limit(limit)
+            )
+        ).all()
+        hits.extend((entity, float(dist)) for entity, dist in rows)
+    hits.sort(key=lambda pair: pair[1])
+    return hits[:limit]
+
+
+async def load_core_names(db: AsyncSession, story: Story) -> list[str]:
+    """Cekirdek karakter isimleri — pinned cekirdek ve entity karti secimi AYNI listeyi
+    kullanir (tek kaynak, tek sorgu)."""
+    rows = (
+        await db.execute(
+            select(Event)
+            .where(Event.story_id == story.id)
+            .order_by(Event.importance.desc(), Event.id)
+            .limit(PINNED_CANDIDATE_POOL)
+        )
+    ).scalars().all()
+    return core_entity_names(story, rows)
+
+
+def _by_kind(entities: list) -> dict[str, list]:
+    grouped: dict[str, list] = {"characters": [], "locations": [], "items": []}
+    for entity in entities:
+        if isinstance(entity, Character):
+            grouped["characters"].append(entity)
+        elif isinstance(entity, Location):
+            grouped["locations"].append(entity)
+        elif isinstance(entity, Item):
+            grouped["items"].append(entity)
+    return grouped
+
+
+async def select_entity_cards(
+    db: AsyncSession,
+    story: Story,
+    user_action: str | None,
+    result: RetrievalResult,
+    core_names: list[str],
+) -> tuple[dict[str, list], dict[str, list]]:
+    """(sabit_cekirdek, sahneye_ozel) tam kartlarini secer. Geri kalan entity'ler prompta
+    yalnizca ISIM olarak girer.
+
+    SABIT CEKIRDEK: protagonist/cok gecen karakterler — bolumden bolume nadiren degisir,
+    bu yuzden ERKEN (cache-dostu) konumda gider.
+    SAHNEYE OZEL: hamlede adi gecenler + son N bolumde gecenler + RAG metinlerinde gecenler
+    + sorguya anlamca yakin olanlar — her bolumde degisir, bu yuzden GEC konumda (RAG yaninda).
+    Tavan: SCENE_CARD_MAX adet / SCENE_CARD_TOKEN_BUDGET token; asanlar isim listesinde kalir."""
+    all_entities = [*story.characters, *story.locations, *story.items]
+    core_folded = {n.casefold() for n in core_names}
+    core = [e for e in story.characters if (e.name or "").casefold() in core_folded]
+    core_ids = {e.id for e in core}
+    candidates_pool = [e for e in all_entities if e.id not in core_ids]
+
+    # --- Adaylari KATMANLI topla. Katman = kartin ne kadar ise yaradigi:
+    #   0 hamlede adi geciyor      -> dogrudan sahnenin konusu
+    #   1 RAG metinlerinde geciyor -> eski malzeme, baska turlu gorunmuyor
+    #   2 sorguya anlamca yakin    -> adi gecmese de ilgili (C4.2 entity embed'leri)
+    #   3 son N bolumde geciyor    -> EN DUSUK: o bolumler zaten TAM METIN gidiyor, model
+    #     onlari okuyabiliyor; kart tekrar olur. Butce daralinca ilk bunlar duser.
+    tiers: dict[int, int] = {}
+    distances: dict[int, float] = {}
+
+    for eid in _mentioned_in(candidates_pool, [user_action or ""]):
+        tiers[eid] = 0
+    for eid in _mentioned_in(candidates_pool, result.texts):
+        tiers.setdefault(eid, 1)
+    if result.query_vec is not None:
+        try:
+            for entity, distance in await _semantically_close_entities(
+                db, story.id, result.query_vec, SCENE_SEMANTIC_TOP
+            ):
+                if entity.id not in core_ids:
+                    tiers.setdefault(entity.id, 2)
+                    distances[entity.id] = distance
+        except Exception:
+            logger.warning("Anlamsal entity secimi atlandi", exc_info=True)
+    for eid in _mentioned_in(candidates_pool, [c.content for c in story.chapters[-LAST_CHAPTERS_FULL_TEXT:]]):
+        tiers.setdefault(eid, 3)
+
+    candidates = [e for e in candidates_pool if e.id in tiers]
+    candidates.sort(key=lambda e: (tiers[e.id], distances.get(e.id, 1.0), e.name))
+
+    # --- Tavan: maliyet KARTIN PROMPTA GIRECEGI HALIYLE olculur (status/bicim dahil),
+    # yoksa butce sessizce asilir.
+    selected: list = []
+    used = 0
+    for entity in candidates[:SCENE_CARD_MAX]:
+        cost = entity_card_tokens(entity)
+        if used + cost > SCENE_CARD_TOKEN_BUDGET:
+            break
+        selected.append(entity)
+        used += cost
+
+    return _by_kind(core), _by_kind(selected)
 
 
 async def retrieve_context_block(db: AsyncSession, story: Story, user_action: str) -> RetrievalResult:
@@ -428,4 +583,5 @@ async def retrieve_context_block(db: AsyncSession, story: Story, user_action: st
         event_ids={e.id for e in entering},
         scene_chapter_ids=scene_chapter_ids,
         texts=[block_text(b) for b in blocks] + event_lines,
+        query_vec=query_vec,
     )
