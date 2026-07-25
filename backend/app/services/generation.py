@@ -20,6 +20,7 @@ from ..database import SessionLocal
 from ..models import Chapter, Character, Chunk, Event, Item, Location, Story
 from ..schemas import story_detail
 from .retrieval import retrieve_context_block
+from .rollup import ensure_rollup
 from .sse import broker
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,11 @@ ENTITY_EMBED_BATCH = 64     # telafide tur basina azami NULL entity karti sayisi
 # denenmez (kullanicinin parasi bosuna yanmasin).
 BACKFILL_PER_RUN = 3
 MAX_BACKFILL_ATTEMPTS = 3
+
+# Chunk backfill'i LLM ICERMEZ (duz metin bolme + tek batch embed) -> olay backfill'inden cok
+# daha ucuz; koşu basina daha fazla bolum islenebilir. Yine de SSE'den SONRA calisir ve
+# bounded'dir: 15 bolumluk bir hikaye iki uretimde tamamlanir, tek seferde hepsi yenmez.
+CHUNK_BACKFILL_PER_RUN = 10
 
 
 def schedule_generation(story_id: int, user_action: str | None, ctx: LlmCtx) -> None:
@@ -166,6 +172,20 @@ async def _generate_chapter(db: AsyncSession, story_id: int, user_action: str | 
     # Lazy backfill EN SON: bolum kullaniciya zaten gonderildi. Bounded + izole; patlarsa
     # uretim sonucu etkilenmez (asla _run_generation'a exception SIZDIRMA, yoksa basarili
     # uretim yanlislikla AI_ERROR olarak isaretlenir).
+    # Sira: ONCE chunk (LLM yok -> hizli, retrieval kalitesini dogrudan yukseltir), SONRA olay
+    # (LLM cagrisi basina saniyeler). Ikisi de kendi try'inda: biri patlarsa digeri calisir.
+    try:
+        await _backfill_chunks(db, story)
+    except Exception:
+        await db.rollback()
+        logger.warning("Chunk backfill'i atlandi (uretim etkilenmedi)", exc_info=True)
+    # Rollup (D2): eksik ark/arka plan ozetleri. Ozet blogunu sabit boyutta tutar; olay
+    # backfill'inden ONCE, cunku prompt boyutuna dogrudan etkisi var.
+    try:
+        await ensure_rollup(db, story, ctx)
+    except Exception:
+        await db.rollback()
+        logger.warning("Rollup atlandi (uretim etkilenmedi; ham ozetlerle devam)", exc_info=True)
     try:
         await _backfill_events(db, story, ctx)
     except Exception:
@@ -276,6 +296,49 @@ async def apply_new_entities_from_edit(
     created_events = _apply_events(db, story.id, chapter_id, parsed)
     await _embed_records(db, story.user_id, created_events)
     await _embed_entities(db, story.user_id, dirty_entities)
+
+
+async def _backfill_chunks(db: AsyncSession, story: Story) -> int:
+    """Chunk katmanindan ONCEKI bolumlere chunk uretir (lazy, bounded, idempotent).
+    LLM YOK — duz metin bolme + tek batch embed, bu yuzden olay backfill'inden cok daha ucuz
+    ve hizli; koşu basina daha fazla bolum islenebilir (CHUNK_BACKFILL_PER_RUN).
+
+    DENEME SAYACI KOLONU GEREKMIYOR (olay backfill'indeki backfill_attempts'in muadili YOK):
+      1. Idempotenslik bedava: "bu bolumun chunk'i var mi" sorgusu zaten filtre. Embed patlasa
+         BILE chunk kayitlari NULL embedding ile YAZILIR, yani bolum bir daha secilmez.
+      2. Korunacak bir deneme MALIYETI yok: olay backfill'i her denemede KULLANICININ
+         anahtariyla LLM cagirir (para yanar) -> tavan sart. Burada bolme CPU'da bedava.
+      3. Tek yeniden-deneme yolu (NULL embedding doldurma) zaten mevcut telafi adiminda ve
+         kendi siniri (EVENT_EMBED_BATCH) ile bounded.
+    Tek acik: icerigi BOS bir bolum 0 chunk uretip her koşuda yeniden secilirdi — sorguda
+    `content != ''` filtresiyle kapatildi (uretim zaten bos icerik kaydetmiyor, savunmaci).
+
+    En YENI chunk'siz bolumden geriye dogru: retrieval'da en cok ise yarayanlar onlar."""
+    rows = (
+        await db.execute(
+            select(Chapter.id, Chapter.content)
+            .where(
+                Chapter.story_id == story.id,
+                Chapter.content != "",
+                ~select(Chunk.id).where(Chunk.chapter_id == Chapter.id).exists(),
+            )
+            .order_by(Chapter.index.desc())  # en yeni once
+            .limit(CHUNK_BACKFILL_PER_RUN)
+        )
+    ).all()
+    if not rows:
+        return 0
+
+    created: list[Chunk] = []
+    for chap_id, content in rows:
+        created.extend(await _apply_chunks(db, story.id, chap_id, content))
+    # Embed'i dilimlere bol: 10 uzun bolum tek istekte saglayicinin token limitini zorlayabilir.
+    # Embed patlarsa chunk'lar NULL ile KALIR (kayit korunur), telafi adimi doldurur.
+    for i in range(0, len(created), EVENT_EMBED_BATCH):
+        await _embed_records(db, story.user_id, created[i : i + EVENT_EMBED_BATCH])
+    await db.commit()
+    logger.info("Hikaye %s: %s bolum icin %s chunk backfill edildi", story.id, len(rows), len(created))
+    return len(rows)
 
 
 async def _backfill_events(db: AsyncSession, story: Story, ctx: LlmCtx) -> None:

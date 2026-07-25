@@ -29,6 +29,13 @@ MAX_SUMMARIES_IN_PROMPT = 60  # older summaries beyond this are dropped
 LAST_CHAPTER_CAP = 12000      # char cap for the last chapter's full text
 PREV_CHAPTER_CAP = 6000       # char cap for the chapter before last
 MAX_ENTITIES_PER_KIND = 60    # cap per character/location/item list; oldest dropped if exceeded
+
+# ---- D2 rollup: the summary block stays a CONSTANT size no matter how long the story gets ----
+ROLLUP_RECENT_CHAPTERS = 20   # newest N chapters keep their full per-chapter summary
+ROLLUP_ARC_SIZE = 10          # chapters compressed into one arc summary
+ROLLUP_MAX_ARCS = 4           # arcs shown individually; older ones collapse into the background
+ARC_SUMMARY_CHAR_CAP = 700    # cap for one arc summary in the prompt
+BACKGROUND_CHAR_CAP = 900     # cap for the single background paragraph
 STATUS_CHAR_CAP = 200         # cap for a character's current-status text
 MAX_EVENTS_PER_CHAPTER = 7    # per-chapter event cap (long chapters mustn't pile up dozens)
 EVENT_TEXT_CAP = 600          # cap for a single event's text
@@ -146,18 +153,71 @@ def _entity_lines(entities, with_status: bool = False, desc_limit: int = 200) ->
     return "\n".join(lines) if lines else "(none yet)"
 
 
+def plan_rollup(last_index: int) -> dict:
+    """D2 rollup plani — YALNIZCA bolum indekslerinden, DETERMINISTIK olarak hesaplanir.
+
+    Ark sinirlari indekse sabitlenmistir (ark k = [k*SIZE+1, (k+1)*SIZE]), hikaye uzadikca
+    DEGISMEZ: boylece bir kez uretilen ark ozeti gecerliligini korur. Bir ark ancak TAMAMI
+    "son N bolum" penceresinin disina cikinca kapanir (yarim ark ozetlenmez — yoksa pencere
+    kaydikca ayni ark tekrar tekrar uretilirdi).
+
+    Doner: tum tamamlanmis arklar, arka plana inenler, prompta tam girenler ve ham (tam) ozetle
+    girecek ilk bolum indeksi. Blok boyutu ust sinirlidir: 1 arka plan + ROLLUP_MAX_ARCS ark +
+    en fazla (ROLLUP_ARC_SIZE-1 + ROLLUP_RECENT_CHAPTERS) bolum ozeti -> hikaye uzasa da SABIT."""
+    cutoff = last_index - ROLLUP_RECENT_CHAPTERS  # bu indeksten BUYUK olanlar tam ozetle girer
+    n_arcs = max(cutoff, 0) // ROLLUP_ARC_SIZE    # kapanmis (tamamlanmis) ark sayisi
+    n_background = max(n_arcs - ROLLUP_MAX_ARCS, 0)  # arka plana inen en eski arklar
+    all_arcs = [
+        (k * ROLLUP_ARC_SIZE + 1, (k + 1) * ROLLUP_ARC_SIZE) for k in range(n_arcs)
+    ]
+    return {
+        "all_arcs": all_arcs,                      # DB'de bulunmasi gereken TUM arklar
+        "background_arcs": all_arcs[:n_background],  # arka plani olusturan arklar
+        "background": (1, n_background * ROLLUP_ARC_SIZE) if n_background else None,
+        "visible_arcs": all_arcs[n_background:],   # prompta ayri ayri giren arklar
+        "full_from": n_arcs * ROLLUP_ARC_SIZE + 1,  # bu indeksten itibaren ham (tam) ozet
+    }
+
+
 def _summaries_block(story: Story) -> str | None:
-    summarized = [c for c in story.chapters if c.summary]
-    if not summarized:
+    """Rollup-farkinda ozet blogu: [arka plan] + [ark ozetleri] + [son bolumlerin tam ozeti].
+
+    Ark/arka plan ozeti DB'de yoksa (henuz uretilmedi ya da duzenleme yuzunden gecersiz kilindi)
+    o aralik icin HAM bolum ozetlerine dusulur — bilgi kaybolmaz, blok gecici olarak buyur."""
+    if not story.chapters:
         return None
-    skipped = len(summarized) - MAX_SUMMARIES_IN_PROMPT
+    plan = plan_rollup(story.chapters[-1].index)
+    stored = {(a.level, a.start_index): a for a in (story.arcs or [])}
+
+    lines: list[str] = []
+    covered_upto = 0  # ark/arka plan ile kapsanan en buyuk bolum indeksi
+
+    if plan["background"]:
+        start, end = plan["background"]
+        arc = stored.get((1, start))
+        if arc and arc.end_index == end:
+            lines.append(
+                f"Background (Chapters {start}-{end}): {_head(arc.summary, BACKGROUND_CHAR_CAP)}"
+            )
+            covered_upto = end
+
+    for start, end in plan["visible_arcs"]:
+        if end <= covered_upto:
+            continue
+        arc = stored.get((0, start))
+        if arc:
+            lines.append(f"Chapters {start}-{end}: {_head(arc.summary, ARC_SUMMARY_CHAR_CAP)}")
+            covered_upto = end
+
+    # Kapsanmayan araliklar + guncel bolumler: ham ozet. Guvenlik tavani, yalnizca geri dusus
+    # halinde devreye girer (arklar hazirsa buraya zaten <= 29 bolum kalir).
+    raw = [c for c in story.chapters if c.index > covered_upto and c.summary]
+    skipped = len(raw) - MAX_SUMMARIES_IN_PROMPT
     if skipped > 0:
-        summarized = summarized[skipped:]
-    lines = [f"Chapter {c.index}: {_head(c.summary, SUMMARY_CHAR_CAP)}" for c in summarized]
-    header = ""
-    if skipped > 0:
-        header = f"(summaries of the oldest {skipped} chapters omitted; see 'relevant past scenes' if needed)\n"
-    return header + "\n".join(lines)
+        raw = raw[skipped:]
+        lines.append(f"(summaries of {skipped} older chapters omitted; see 'relevant past scenes' if needed)")
+    lines.extend(f"Chapter {c.index}: {_head(c.summary, SUMMARY_CHAR_CAP)}" for c in raw)
+    return "\n".join(lines) if lines else None
 
 
 def parse_edit_notes(raw: str | None) -> list[str]:
@@ -235,6 +295,25 @@ def build_chapter_system_prompt(
         )
 
     return "\n\n".join(parts)
+
+
+# ---- D2 rollup prompts (util model, reasoning off; run OUTSIDE the generation path) ----
+# Language-agnostic: the compression is ALWAYS written in the input's language.
+ARC_SUMMARY_PROMPT = (
+    "You will be given the chapter summaries of one arc of a story (a consecutive block of chapters). "
+    "Compress them into a SINGLE dense paragraph that preserves everything later chapters must not "
+    "contradict: who did what, what changed permanently, what was revealed, what is still unresolved. "
+    "Keep concrete names, places and objects; drop atmosphere, repetition and scene-level detail. "
+    "Aim for 4-6 sentences. Write in the SAME LANGUAGE as the summaries. Output ONLY the paragraph."
+)
+
+BACKGROUND_SUMMARY_PROMPT = (
+    "You will be given several arc summaries covering the earliest part of a long story. "
+    "Compress them into ONE short paragraph of background: the essential setup and the lasting "
+    "consequences a writer must still respect today. Keep the names and facts that still matter; "
+    "drop everything that has since been resolved or superseded. Aim for 3-4 sentences. "
+    "Write in the SAME LANGUAGE as the input. Output ONLY the paragraph."
+)
 
 
 # Language-agnostic: the summary is ALWAYS written in the chapter's language.

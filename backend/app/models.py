@@ -81,6 +81,35 @@ class Story(Base):
     items: Mapped[list["Item"]] = relationship(
         cascade="all, delete-orphan", order_by="Item.id", lazy="selectin"
     )
+    # selectin: prompt kurucusu SENKRON ve saf; arklara async lazy-load olmadan erisebilsin
+    arcs: Mapped[list["Arc"]] = relationship(
+        cascade="all, delete-orphan", order_by="Arc.start_index", lazy="selectin"
+    )
+
+
+class Arc(Base):
+    """Rollup katmani (D2): bolum ozetlerinin SIKISTIRILMIS ust katmanlari. Amac, hikaye kac
+    bolum olursa olsun ozet blogunun token boyutunun SABIT kalmasi — ama hicbir sey unutulmadan
+    (eski bilgi silinmez, sikisir).
+
+    level 0 = ARK: ard arda ROLLUP_ARC_SIZE bolumun ozeti tek paragrafa iner.
+    level 1 = ARKA PLAN: en eski arklarin ozeti tek paragraflik "buraya kadar hikaye"ye iner.
+
+    Ozetler DB'de saklanir, HER URETIMDE YENIDEN URETILMEZ. Gecersiz kilma = SILME: icindeki
+    bir bolum duzenlenince o ark (ve onu kapsayan arka plan) silinir; bir sonraki rollup
+    kosusunda yeniden uretilir, o ana kadar prompt ham bolum ozetlerine duser (kayip yok)."""
+
+    __tablename__ = "arcs"
+    __table_args__ = (UniqueConstraint("story_id", "level", "start_index"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    story_id: Mapped[int] = mapped_column(ForeignKey("stories.id", ondelete="CASCADE"), index=True)
+    level: Mapped[int] = mapped_column(Integer)  # 0 = ark, 1 = arka plan
+    start_index: Mapped[int] = mapped_column(Integer)  # kapsanan ilk bolum indeksi (dahil)
+    end_index: Mapped[int] = mapped_column(Integer)    # kapsanan son bolum indeksi (dahil)
+    summary: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
 
 class Chapter(Base):

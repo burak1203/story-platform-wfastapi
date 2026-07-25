@@ -42,6 +42,7 @@ from ..services.retrieval import (
     story_has_embedded_chunks,
     story_has_embedded_events,
 )
+from ..services.rollup import invalidate_for_chapter
 from ..services.sse import broker
 
 logger = logging.getLogger(__name__)
@@ -222,6 +223,11 @@ async def edit_chapter(
     except Exception:
         logger.warning("Duzenlenen bolumden entity/olay cikarimi atlandi", exc_info=True)
 
+    # Bolumun ozeti degisti -> onu iceren ark (ve kapsayan arka plan) bayat: gecersiz kil.
+    # Yalnizca ILGILI ark silinir; bir sonraki uretimde yeniden uretilir, o ana kadar prompt
+    # bu aralik icin ham bolum ozetlerine duser.
+    await invalidate_for_chapter(db, story.id, chapter_index)
+
     # Bir SONRAKI uretime tasinacak not: modele "burada su degisti" diye soyle
     notes = parse_edit_notes(story.pending_edit_notes)
     notes.append(
@@ -249,6 +255,8 @@ async def edit_chapter_summary(
         raise HTTPException(status_code=404, detail="Bölüm bulunamadı.")
 
     chapter.summary = request.new_summary.strip() or None
+    # Ozet ark ozetinin GIRDISI: elle degistirilince o ark da bayat olur
+    await invalidate_for_chapter(db, story.id, chapter_index)
     await db.commit()
     story = await db.get(Story, story_id, populate_existing=True)
     return story_detail(story)
