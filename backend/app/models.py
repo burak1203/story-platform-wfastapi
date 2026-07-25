@@ -128,6 +128,14 @@ class Chapter(Base):
     # Olay sisteminden onceki bolumler icin lazy backfill deneme sayaci: sonsuz yeniden
     # deneme olmasin diye (MAX'a ulasinca o bolum backfill'de artik denenmez).
     backfill_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    # Token muhasebesi (D3.1). prompt/completion: SAGLAYICININ bildirdigi gercek sayilar.
+    # cached_prompt_tokens: prefix cache isabeti (DeepSeek/OpenAI bildirirse) — prompt sirasi
+    # calismalarinin gercek olcusu. token_breakdown: tiktoken ile bilesen bazli kirilim (JSON).
+    # Saglayici usage dondurmezse NULL kalir. UI Faz 3 (developer mode).
+    prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    completion_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cached_prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    token_breakdown: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     story: Mapped[Story] = relationship(back_populates="chapters")

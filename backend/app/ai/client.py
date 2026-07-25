@@ -41,6 +41,32 @@ class LlmCtx:
         return f"LlmCtx(provider={self.provider!r}, base_url={self.base_url!r}, story_model={self.story_model!r})"
 
 
+@dataclass(frozen=True)
+class LlmUsage:
+    """Saglayicinin bildirdigi GERCEK token sayilari (tahmin degil). cached_prompt_tokens
+    prefix cache isabeti: DeepSeek `prompt_cache_hit_tokens`, OpenAI
+    `prompt_tokens_details.cached_tokens` alaninda doner — saglayici bildirmezse None."""
+
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    cached_prompt_tokens: int | None = None
+
+
+def _extract_usage(response) -> LlmUsage:
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return LlmUsage()
+    cached = getattr(usage, "prompt_cache_hit_tokens", None)  # DeepSeek
+    if cached is None:
+        details = getattr(usage, "prompt_tokens_details", None)  # OpenAI
+        cached = getattr(details, "cached_tokens", None) if details is not None else None
+    return LlmUsage(
+        prompt_tokens=getattr(usage, "prompt_tokens", None),
+        completion_tokens=getattr(usage, "completion_tokens", None),
+        cached_prompt_tokens=cached,
+    )
+
+
 def _make_client(ctx: LlmCtx) -> AsyncOpenAI:
     return AsyncOpenAI(
         api_key=ctx.api_key,
@@ -118,7 +144,9 @@ async def _with_retry(coro_factory, what: str):
     raise last_exc
 
 
-async def chat_json(ctx: LlmCtx, model: str, system: str, user: str, temperature: float = 0.8, max_tokens: int = 8192, reasoning: bool = True) -> dict:
+async def chat_json_with_usage(ctx: LlmCtx, model: str, system: str, user: str, temperature: float = 0.8, max_tokens: int = 8192, reasoning: bool = True) -> tuple[dict, LlmUsage]:
+    """chat_json + saglayicinin bildirdigi gercek token sayilari. Bolum uretimi bunu kullanir
+    (token paneli, D3); usage'a ihtiyaci olmayan cagrilar sade chat_json'i cagirir."""
     client = _make_client(ctx)
     reasoning_off = _disable_body(ctx, reasoning)
     try:
@@ -147,13 +175,18 @@ async def chat_json(ctx: LlmCtx, model: str, system: str, user: str, temperature
                 logger.warning("LLM cevabi max_tokens sinirinda kesildi; JSON onarimi denenecek.")
             raw = choice.message.content or ""
             try:
-                return parse_llm_json(raw)
+                return parse_llm_json(raw), _extract_usage(response)
             except ValueError as exc:
                 last_error = exc
                 logger.warning("LLM ciktisi JSON olarak ayiklanamadi (deneme %d/2)", attempt + 1)
         raise last_error
     finally:
         await client.close()
+
+
+async def chat_json(ctx: LlmCtx, model: str, system: str, user: str, temperature: float = 0.8, max_tokens: int = 8192, reasoning: bool = True) -> dict:
+    parsed, _ = await chat_json_with_usage(ctx, model, system, user, temperature, max_tokens, reasoning)
+    return parsed
 
 
 async def chat_text(ctx: LlmCtx, model: str, system: str, user: str, temperature: float = 0.4, max_tokens: int = 1024, reasoning: bool = True) -> str:

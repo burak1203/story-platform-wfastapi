@@ -230,6 +230,87 @@ def parse_edit_notes(raw: str | None) -> list[str]:
         return []
 
 
+def build_chapter_prompt_sections(
+    story: Story,
+    retrieved_block: str | None,
+    pinned_block: str | None = None,
+    genres: list[str] | None = None,
+) -> list[tuple[str, str]]:
+    """Sistem promptunu (bilesen_anahtari, metin) ciftleri olarak kurar. Anahtarlar token
+    KIRILIMI icin (D3): hangi bolum ne kadar token yiyor. Sira cache-dostudur — bkz. modul
+    docstring'i: sabit -> buyuyen -> yavas -> cache-kirici."""
+    is_continuation = bool(story.chapters)
+    sections: list[tuple[str, str]] = []
+
+    # ===== 1. FIXED PREFIX (never changes across a story's chapters -> cache lands here) =====
+    sections.append(("fixed", BASE_IDENTITY))
+    sections.append(("fixed", f"[STORY TITLE]\n{story.title}"))
+
+    genre_block = _genre_block(genres or [])
+    if genre_block:
+        sections.append(("fixed", "[GENRE MODULES]\n" + genre_block))
+    if story.style_prompt and story.style_prompt.strip():
+        sections.append(
+            ("fixed", "[AUTHOR'S PERSISTENT INSTRUCTION - APPLY EVERY CHAPTER]\n" + story.style_prompt.strip())
+        )
+    if story.negative_prompt and story.negative_prompt.strip():
+        sections.append(("fixed", "[FORBIDDEN - STRICTLY AVOID]\n" + story.negative_prompt.strip()))
+    sections.append(("fixed", TASK_CONTINUATION if is_continuation else TASK_FIRST))
+    sections.append(("fixed", JSON_FORMAT_BLOCK))
+
+    # ===== 2. GROWING (append-only -> shared prefix stays cached as chapters accrue) =====
+    summaries = _summaries_block(story)
+    if summaries:
+        sections.append(("rollup", "[CHAPTER SUMMARIES - CHRONOLOGICAL]\n" + summaries))
+
+    # ===== 3. SLOW VARIABLES (change occasionally) =====
+    if is_continuation:
+        sections.append((
+            "entities",
+            "[KNOWN UNIVERSE]\n"
+            f"Characters:\n{_entity_lines(story.characters, with_status=True)}\n\n"
+            f"Locations:\n{_entity_lines(story.locations)}\n\n"
+            f"Items:\n{_entity_lines(story.items)}",
+        ))
+    if pinned_block:
+        sections.append(("pinned", "[PINNED KEY EVENTS - ALWAYS RELEVANT]\n" + pinned_block))
+
+    # ===== 4. CACHE-BREAKERS (change every chapter -> kept last so they don't spoil the prefix) =====
+    if is_continuation:
+        last = story.chapters[-1]
+        if len(story.chapters) >= 2:
+            prev = story.chapters[-2]
+            sections.append((
+                "last_chapters",
+                f"[PREVIOUS CHAPTER (Chapter {prev.index}) - FULL TEXT]\n{_tail(prev.content, PREV_CHAPTER_CAP)}",
+            ))
+        sections.append((
+            "last_chapters",
+            f"[LAST CHAPTER (Chapter {last.index}) - FULL TEXT]\n{_tail(last.content, LAST_CHAPTER_CAP)}",
+        ))
+    if retrieved_block:
+        sections.append((
+            "rag",
+            "[RELEVANT SCENES FROM PAST CHAPTERS]\n"
+            "Older scenes that may relate to the reader's move (use for consistency):\n" + retrieved_block,
+        ))
+
+    edit_notes = parse_edit_notes(story.pending_edit_notes)
+    if edit_notes:
+        sections.append((
+            "edit_notes",
+            "[AUTHOR'S RECENT EDITS - VERY IMPORTANT]\n"
+            "The author manually changed past chapters. The CURRENT state of the story is below; "
+            "do not contradict the old version:\n- " + "\n- ".join(edit_notes),
+        ))
+
+    return sections
+
+
+def join_sections(sections: list[tuple[str, str]]) -> str:
+    return "\n\n".join(text for _, text in sections)
+
+
 def build_chapter_system_prompt(
     story: Story,
     retrieved_block: str | None,
@@ -238,63 +319,31 @@ def build_chapter_system_prompt(
 ) -> str:
     """Single template for both the first chapter and continuations. Components are ordered
     slowest-changing first for provider prefix caching (see module docstring)."""
-    is_continuation = bool(story.chapters)
+    return join_sections(build_chapter_prompt_sections(story, retrieved_block, pinned_block, genres))
 
-    # ===== 1. FIXED PREFIX (never changes across a story's chapters -> cache lands here) =====
-    parts: list[str] = [BASE_IDENTITY, f"[STORY TITLE]\n{story.title}"]
 
-    genre_block = _genre_block(genres or [])
-    if genre_block:
-        parts.append("[GENRE MODULES]\n" + genre_block)
-    if story.style_prompt and story.style_prompt.strip():
-        parts.append("[AUTHOR'S PERSISTENT INSTRUCTION - APPLY EVERY CHAPTER]\n" + story.style_prompt.strip())
-    if story.negative_prompt and story.negative_prompt.strip():
-        parts.append("[FORBIDDEN - STRICTLY AVOID]\n" + story.negative_prompt.strip())
-    parts.append(TASK_CONTINUATION if is_continuation else TASK_FIRST)
-    parts.append(JSON_FORMAT_BLOCK)
+def token_breakdown(sections: list[tuple[str, str]], user_message: str) -> dict[str, int]:
+    """Gonderim ONCESI bilesen bazli token kirilimi (tiktoken). Gercek sayilar saglayicinin
+    usage'indan gelir (LlmUsage); bu kirilim "hangi bolum ne kadar yer kapliyor" sorusunu
+    cevaplar — ikisi birlikte token panelini (Faz 3 UI) besler.
 
-    # ===== 2. GROWING (append-only -> shared prefix stays cached as chapters accrue) =====
-    summaries = _summaries_block(story)
-    if summaries:
-        parts.append("[CHAPTER SUMMARIES - CHRONOLOGICAL]\n" + summaries)
+    KUMULATIF FARK yontemi: her bilesenin payi, o bilesen EKLENDIGINDE toplamin ne kadar
+    arttigidir. Bileseni tek basina saymak yanlis olurdu — birlestirmede sinir karakterleri
+    ayiracla tek token'a kaynayabiliyor; bu yontemde paylar toplami her zaman gercek toplama
+    TAM esittir."""
+    from .chunking import count_tokens  # gec import: chunking -> prompts bagimliligi olmasin
 
-    # ===== 3. SLOW VARIABLES (change occasionally) =====
-    if is_continuation:
-        parts.append(
-            "[KNOWN UNIVERSE]\n"
-            f"Characters:\n{_entity_lines(story.characters, with_status=True)}\n\n"
-            f"Locations:\n{_entity_lines(story.locations)}\n\n"
-            f"Items:\n{_entity_lines(story.items)}"
-        )
-    if pinned_block:
-        parts.append("[PINNED KEY EVENTS - ALWAYS RELEVANT]\n" + pinned_block)
-
-    # ===== 4. CACHE-BREAKERS (change every chapter -> kept last so they don't spoil the prefix) =====
-    if is_continuation:
-        last = story.chapters[-1]
-        if len(story.chapters) >= 2:
-            prev = story.chapters[-2]
-            parts.append(
-                f"[PREVIOUS CHAPTER (Chapter {prev.index}) - FULL TEXT]\n{_tail(prev.content, PREV_CHAPTER_CAP)}"
-            )
-        parts.append(
-            f"[LAST CHAPTER (Chapter {last.index}) - FULL TEXT]\n{_tail(last.content, LAST_CHAPTER_CAP)}"
-        )
-    if retrieved_block:
-        parts.append(
-            "[RELEVANT SCENES FROM PAST CHAPTERS]\n"
-            "Older scenes that may relate to the reader's move (use for consistency):\n" + retrieved_block
-        )
-
-    edit_notes = parse_edit_notes(story.pending_edit_notes)
-    if edit_notes:
-        parts.append(
-            "[AUTHOR'S RECENT EDITS - VERY IMPORTANT]\n"
-            "The author manually changed past chapters. The CURRENT state of the story is below; "
-            "do not contradict the old version:\n- " + "\n- ".join(edit_notes)
-        )
-
-    return "\n\n".join(parts)
+    breakdown: dict[str, int] = {}
+    joined = ""
+    previous = 0
+    for i, (key, text) in enumerate(sections):
+        joined = text if i == 0 else f"{joined}\n\n{text}"
+        current = count_tokens(joined)
+        breakdown[key] = breakdown.get(key, 0) + (current - previous)
+        previous = current
+    breakdown["move"] = count_tokens(user_message)
+    breakdown["total"] = previous + breakdown["move"]
+    return breakdown
 
 
 # ---- D2 rollup prompts (util model, reasoning off; run OUTSIDE the generation path) ----

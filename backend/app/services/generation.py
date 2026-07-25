@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 
 from openai import RateLimitError
@@ -14,12 +15,14 @@ from ..ai.prompts import (
     EVENT_TEXT_CAP,
     MAX_EVENTS_PER_CHAPTER,
     SINGLE_CHAPTER_SUMMARY_PROMPT,
-    build_chapter_system_prompt,
+    build_chapter_prompt_sections,
+    join_sections,
+    token_breakdown,
 )
 from ..database import SessionLocal
 from ..models import Chapter, Character, Chunk, Event, Item, Location, Story
 from ..schemas import story_detail
-from .retrieval import retrieve_context_block
+from .retrieval import RetrievalResult, build_pinned_block, retrieve_context_block
 from .rollup import ensure_rollup
 from .sse import broker
 
@@ -111,20 +114,33 @@ async def _generate_chapter(db: AsyncSession, story_id: int, user_action: str | 
 
     is_first = len(story.chapters) == 0
 
-    retrieved_block = None
+    retrieval = RetrievalResult()
     if not is_first and user_action and len(story.chapters) >= RETRIEVAL_MIN_CHAPTERS:
         try:
-            retrieved_block = await retrieve_context_block(db, story, user_action)
+            retrieval = await retrieve_context_block(db, story, user_action)
         except Exception:
             logger.warning("Gecmis bolum aramasi atlandi", exc_info=True)
 
-    system_prompt = build_chapter_system_prompt(story, retrieved_block)
+    # Pinned cekirdek: SORGUDAN BAGIMSIZ, RAG bos donse bile gider. RAG'le gelen olaylar elenir.
+    pinned_block = None
+    if not is_first:
+        try:
+            pinned_block = await build_pinned_block(db, story, retrieval.event_ids)
+        except Exception:
+            logger.warning("Pinned cekirdek atlandi", exc_info=True)
+
+    sections = build_chapter_prompt_sections(story, retrieval.block, pinned_block)
+    system_prompt = join_sections(sections)
     # Kullanicinin hamlesi USER mesajinda (cache-dostu: sistem promptu sabit prefix, hamle degisken)
     user_message = (
         f"Story topic: {story.initial_prompt}" if is_first else f"Reader's move: {user_action}"
     )
+    # Gonderim ONCESI tahmini kirilim; gercek sayilar asagida usage'dan gelir
+    breakdown = token_breakdown(sections, user_message)
 
-    parsed = await ai.chat_json(ctx, ctx.story_model, system_prompt, user_message, temperature=0.8)
+    parsed, usage = await ai.chat_json_with_usage(
+        ctx, ctx.story_model, system_prompt, user_message, temperature=0.8
+    )
     content = str(parsed.get("content") or "").strip()
     if not content:
         raise ValueError("Model boş bölüm içeriği döndürdü.")
@@ -135,7 +151,18 @@ async def _generate_chapter(db: AsyncSession, story_id: int, user_action: str | 
     # NOT: chapters.embedding artik YAZILMAZ. Retrieval olay-embed'e (OpenAI uzayi) tasindi;
     # eski kolon GEMINI uzayindadir, dokunulmaz (yeni bolumlerde NULL kalir, sorgulanmaz).
     next_index = (story.chapters[-1].index + 1) if story.chapters else 1
-    chapter = Chapter(story_id=story.id, index=next_index, content=content, summary=summary)
+    chapter = Chapter(
+        story_id=story.id,
+        index=next_index,
+        content=content,
+        summary=summary,
+        # Token muhasebesi (D3.1): saglayicinin GERCEK sayilari + tiktoken bilesen kirilimi.
+        # UI Faz 3'te; simdilik kayit + log.
+        prompt_tokens=usage.prompt_tokens,
+        completion_tokens=usage.completion_tokens,
+        cached_prompt_tokens=usage.cached_prompt_tokens,
+        token_breakdown=json.dumps(breakdown, ensure_ascii=False),
+    )
     db.add(chapter)
     await db.flush()  # olaylarin FK'si icin chapter.id gerekiyor
     dirty_entities = _apply_entities(db, story, parsed)
@@ -149,6 +176,13 @@ async def _generate_chapter(db: AsyncSession, story_id: int, user_action: str | 
     story.pending_edit_notes = None  # duzenleme notlari bu uretimde kullanildi
     story.status = "COMPLETED"
     await db.commit()
+
+    # Token muhasebesi logu: cache isabeti prompt sirasi degisikliklerinin gercek olcusudur
+    logger.info(
+        "Hikaye %s bolum %s | prompt=%s (cache-hit=%s) completion=%s | kirilim=%s",
+        story_id, next_index, usage.prompt_tokens, usage.cached_prompt_tokens,
+        usage.completion_tokens, breakdown,
+    )
 
     # Bolum hazir: okuyucuya gonder
     story = await db.get(Story, story_id, populate_existing=True)

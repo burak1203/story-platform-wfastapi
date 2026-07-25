@@ -16,6 +16,7 @@ bolumun sonundaysa bas alintida hic gorunmuyordu.
 """
 
 import logging
+from dataclasses import dataclass, field
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -39,6 +40,25 @@ LAST_CHAPTERS_FULL_TEXT = 2
 # new = old + (CEIL - old) * GROWTH -> her cekilis daha az ekler, hicbir sey 1.0'a kosmaz.
 IMPORTANCE_CEIL = 0.95
 IMPORTANCE_GROWTH = 0.2
+
+# Pinned cekirdek (D3.1): SORGUDAN BAGIMSIZ olarak her uretimde giden olaylar. "1. bolumun
+# baskarakteri 90. bolumde hala baglamda" garantisi budur — RAG bos donse bile giderler.
+PINNED_MAX_EVENTS = 10
+PINNED_TOKEN_BUDGET = 500
+PINNED_CORE_ENTITIES = 3   # kac karakter "cekirdek" (protagonist/cok gecen) sayilsin
+PINNED_CANDIDATE_POOL = 60  # importance'a gore cekilen aday olay sayisi (bellekte elenir)
+
+
+@dataclass
+class RetrievalResult:
+    """RAG cikti paketi. Sadece metin degil, prompta NELERIN girdigi de doner:
+    - event_ids: pinned cekirdek ayni olayi ikinci kez gondermesin diye
+    - scene_chapter_ids / texts: D3.2 entity secimi "sahnede kim var" diye bakabilsin"""
+
+    block: str | None = None
+    event_ids: set[int] = field(default_factory=set)
+    scene_chapter_ids: set[int] = field(default_factory=set)
+    texts: list[str] = field(default_factory=list)
 
 
 def build_retrieval_query(story: Story, user_action: str) -> str:
@@ -275,7 +295,82 @@ def _format_scenes(blocks: list[dict]) -> str:
     return "\n\n".join(render_block(b) for b in blocks)
 
 
-async def retrieve_context_block(db: AsyncSession, story: Story, user_action: str) -> str | None:
+def core_entity_names(story: Story, events: list[Event], limit: int = PINNED_CORE_ENTITIES) -> list[str]:
+    """Hikayenin "cekirdek" karakterleri: adi verilen olaylarda EN COK gecenler. Olay metinleri
+    kendi basina anlasilir olacak sekilde (acik isimlerle, zamir YOK) uretildigi icin bu sayim
+    protagonist/cok gecen karakteri ucuza ve LLM'siz yakalar."""
+    texts = [(e.text or "").casefold() for e in events]
+    counts: list[tuple[int, str]] = []
+    for character in story.characters:
+        name = (character.name or "").strip()
+        if not name:
+            continue
+        folded = name.casefold()
+        hits = sum(1 for t in texts if folded in t)
+        if hits:
+            counts.append((hits, name))
+    counts.sort(key=lambda x: (-x[0], x[1]))
+    return [name for _, name in counts[:limit]]
+
+
+async def build_pinned_block(
+    db: AsyncSession, story: Story, exclude_event_ids: set[int] | None = None
+) -> str | None:
+    """Pinned cekirdek: SORGUDAN BAGIMSIZ, her uretimde giden olaylar. Iki kaynak birlesir:
+      1. En yuksek importance'li olaylar (hikayenin donum noktalari),
+      2. Cekirdek karakterlere (protagonist/cok gecen) DOKUNAN olaylar — puani biraz dusuk
+         olsa da surekliligin bel kemigi.
+    RAG'le zaten gonderilen olaylar (exclude_event_ids) elenir: ayni sey iki kez gitmesin.
+    Son N bolum de elenir (zaten tam metin gidiyorlar). Tavan: PINNED_MAX_EVENTS olay ve
+    PINNED_TOKEN_BUDGET token — hangisi once dolarsa.
+
+    Not: importance dinamiktir (RAG'le cekildikce yukselir), yani pinned kume zamanla
+    hikayenin gercekten ise yarayan omurgasina dogru kayar."""
+    excluded_chapters = _excluded_chapter_ids(story)
+    exclude_event_ids = exclude_event_ids or set()
+
+    rows = (
+        await db.execute(
+            select(Event)
+            .where(Event.story_id == story.id)
+            .order_by(Event.importance.desc(), Event.id)
+            .limit(PINNED_CANDIDATE_POOL)
+        )
+    ).scalars().all()
+
+    candidates = [
+        e for e in rows if e.id not in exclude_event_ids and e.chapter_id not in excluded_chapters
+    ]
+    if not candidates:
+        return None
+
+    core = [n.casefold() for n in core_entity_names(story, rows)]
+    # Cekirdek karaktere dokunan olaylar one alinir; esitlikte importance belirler.
+    def rank(event: Event) -> tuple[int, float]:
+        touches_core = any(n in (event.text or "").casefold() for n in core)
+        return (0 if touches_core else 1, -event.importance)
+
+    candidates.sort(key=rank)
+
+    id_to_index = {c.id: c.index for c in story.chapters}
+    lines: list[str] = []
+    used = 0
+    for event in candidates[:PINNED_MAX_EVENTS]:
+        line = f"- Chapter {id_to_index.get(event.chapter_id, '?')}: {event.text}"
+        cost = count_tokens(line)
+        if used + cost > PINNED_TOKEN_BUDGET:
+            break
+        lines.append(line)
+        used += cost
+
+    if not lines:
+        return None
+    # Kronolojik okunsun (prompt icinde zaman akisi bozulmasin)
+    lines.sort(key=lambda l: int(l.split()[2].rstrip(":")) if l.split()[2].rstrip(":").isdigit() else 0)
+    return "\n".join(lines)
+
+
+async def retrieve_context_block(db: AsyncSession, story: Story, user_action: str) -> RetrievalResult:
     """Prompta girecek RAG blogunu kurar (7 adimin tamami). Chunk'i olmayan hikayede olay
     yoluna duser (C4.4 backfill'i doldurana kadar); ikisi de yoksa None (RAG blogu atlanir,
     uretim ozet + son N bolum + entity ile devam eder).
@@ -284,12 +379,12 @@ async def retrieve_context_block(db: AsyncSession, story: Story, user_action: st
     Hikayede ne chunk ne olay varsa hic embed yapilmaz — bosuna kota harcanmaz."""
     query = build_retrieval_query(story, user_action)
     if not query:
-        return None
+        return RetrievalResult()
 
     has_chunks = await story_has_embedded_chunks(db, story.id)
     has_events = await story_has_embedded_events(db, story.id)
     if not has_chunks and not has_events:
-        return None
+        return RetrievalResult()
 
     query_vec = await embed_query(db, story, query)
     excluded = _excluded_chapter_ids(story)
@@ -303,6 +398,7 @@ async def retrieve_context_block(db: AsyncSession, story: Story, user_action: st
 
     # Adim 7: olaylar — YALNIZCA chunk isabeti OLMAYAN bolumlerden, ayri blok olarak.
     event_lines: list[str] = []
+    entering: list[Event] = []
     remaining = RAG_TOKEN_BUDGET - used
     if remaining > 0 and has_events:
         # Chunk isabeti olan bolumler + son N bolum SORGUDAN elenir: ayni sey iki kez
@@ -311,7 +407,6 @@ async def retrieve_context_block(db: AsyncSession, story: Story, user_action: st
             db, story, query_vec, exclude_chapter_ids=scene_chapter_ids | excluded
         )
         id_to_index = {c.id: c.index for c in story.chapters}
-        entering: list[Event] = []
         for event, _ in event_hits:
             line = f"- Chapter {id_to_index.get(event.chapter_id, '?')}: {event.text}"
             cost = count_tokens(line)
@@ -328,4 +423,9 @@ async def retrieve_context_block(db: AsyncSession, story: Story, user_action: st
         parts.append(_format_scenes(blocks))
     if event_lines:
         parts.append("Key events from other chapters:\n" + "\n".join(event_lines))
-    return "\n\n".join(parts) if parts else None
+    return RetrievalResult(
+        block="\n\n".join(parts) if parts else None,
+        event_ids={e.id for e in entering},
+        scene_chapter_ids=scene_chapter_ids,
+        texts=[block_text(b) for b in blocks] + event_lines,
+    )
