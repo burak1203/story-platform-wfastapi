@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
@@ -10,11 +11,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..ai import embeddings
 from ..ai.client import LlmCtx
 from ..database import get_db
-from ..models import PromptItem, Story, User
+from ..models import (
+    READABLE_WITHOUT_OWNER,
+    VISIBILITY_PUBLIC,
+    PromptItem,
+    Story,
+    User,
+)
 from ..ai.prompts import parse_edit_notes
 from ..schemas import (
     MAX_PROMPT_ITEM_LEN,
     MAX_PROMPT_ITEMS,
+    MAX_TAG_LEN,
+    MAX_TAGS,
     ContinueStoryRequest,
     CreatePromptItemRequest,
     CreateStoryRequest,
@@ -26,6 +35,7 @@ from ..schemas import (
     StoryDetailResponse,
     StorySummaryResponse,
     UpdatePromptItemRequest,
+    UpdatePublishingRequest,
     UpdateStorySettingsRequest,
     story_detail,
     story_summary,
@@ -178,6 +188,66 @@ async def update_story_settings(
     """Hikaye bazli uretim ayarlari. Talimat maddeleri ayri uclarda (prompt-items)."""
     story = await _get_owned_story(story_id, user, db)
     story.last_chapters_full_text = request.last_chapters_full_text
+    await db.commit()
+    story = await db.get(Story, story_id, populate_existing=True)
+    return story_detail(story)
+
+
+def _normalize_tags(raw: list[str] | None) -> list[str]:
+    """Etiketleri normalize eder: kirp, kucult, bosları ele, TEKRARI KALDIR (sira korunur).
+    Normalizasyon YAZMA aninda yapilir ki arama tarafinda her sorguda tekrar edilmesin."""
+    if raw is None:
+        return []
+    seen: set[str] = set()
+    tags: list[str] = []
+    for item in raw:
+        tag = " ".join(str(item).split()).lower()[:MAX_TAG_LEN]
+        if tag and tag not in seen:
+            seen.add(tag)
+            tags.append(tag)
+    return tags[:MAX_TAGS]
+
+
+@router.put("/{story_id}/publishing", response_model=StoryDetailResponse)
+async def update_publishing(
+    story_id: int,
+    payload: UpdatePublishingRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Yayimlama ayarlari: gorunurluk, aciklama, etiketler, yetiskin isareti.
+
+    IKI SERT KURAL:
+      1. public + is_adult YASAK — bastan engellenir (operator TR'de, 5651). Faz 4'e
+         birakilmaz: yasak icerigin bir an bile yayinda olmamasi gerekir.
+      2. public'e gecerken kurallar onayi (rules_accepted) ZORUNLU.
+    published_at yalnizca ILK yayimda doldurulur: yayindan alip geri koyarak ana sayfada
+    one cikma (gaming) engellensin."""
+    story = await _get_owned_story(story_id, user, db)
+
+    is_adult = payload.is_adult
+    if payload.visibility == VISIBILITY_PUBLIC and is_adult:
+        raise HTTPException(
+            status_code=400,
+            detail="Yetişkin içerik olarak işaretlenen hikaye herkese açık yayımlanamaz.",
+        )
+    if payload.visibility == VISIBILITY_PUBLIC and story.visibility != VISIBILITY_PUBLIC:
+        if not payload.rules_accepted:
+            raise HTTPException(
+                status_code=400, detail="Yayımlamak için içerik kurallarını onaylaman gerekiyor."
+            )
+        if not story.chapters:
+            raise HTTPException(status_code=400, detail="Boş hikaye yayımlanamaz.")
+
+    story.visibility = payload.visibility
+    story.is_adult = is_adult
+    if payload.description is not None:
+        story.description = payload.description.strip() or None
+    if payload.tags is not None:
+        story.tags = _normalize_tags(payload.tags)
+    if story.visibility in READABLE_WITHOUT_OWNER and story.published_at is None:
+        story.published_at = datetime.now(timezone.utc).replace(tzinfo=None)
+
     await db.commit()
     story = await db.get(Story, story_id, populate_existing=True)
     return story_detail(story)

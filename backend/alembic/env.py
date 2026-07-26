@@ -28,6 +28,18 @@ if config.config_file_name is not None:
 # autogenerate icin model metadata'si
 target_metadata = Base.metadata
 
+# Alembic IFADE indekslerini (to_tsvector(...) gibi) karsilastiramaz: DB'dekiyle modeldekini
+# esitleyemedigi icin HER autogenerate'te gereksiz bir "drop + create" diffi uretir. Bu, gercek
+# semа degisikliklerini gurultuye gomer. Bu indeksleri karsilastirmadan haric tut — migration'da
+# bir kez olusturulurlar, degistirmek gerekirse elle yeni bir migration yazilir.
+_EXPRESSION_INDEXES = {"ix_stories_search_gin"}
+
+
+def include_object(obj, name, type_, reflected, compare_to):
+    if type_ == "index" and name in _EXPRESSION_INDEXES:
+        return False
+    return True
+
 # other values from the config, defined by the needs of env.py,
 # can be acquired:
 # my_important_option = config.get_main_option("my_important_option")
@@ -52,6 +64,7 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
+        include_object=include_object,
     )
 
     with context.begin_transaction():
@@ -59,7 +72,9 @@ def run_migrations_offline() -> None:
 
 
 def do_run_migrations(connection: Connection) -> None:
-    context.configure(connection=connection, target_metadata=target_metadata)
+    context.configure(
+        connection=connection, target_metadata=target_metadata, include_object=include_object
+    )
 
     with context.begin_transaction():
         context.run_migrations()

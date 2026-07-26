@@ -12,7 +12,9 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .config import settings
@@ -33,6 +35,9 @@ class User(Base):
     email: Mapped[str | None] = mapped_column(String(255), unique=True, nullable=True)
     # Google ile acilan hesaplarin sifresi yoktur (None); sifreli giriste None reddedilir
     password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Moderasyon yetkisi (Faz 4'te kullanilacak): rapor listesi, gizle/sil, dondur.
+    # Yalnizca admin is_showcase isaretleyebilir.
+    is_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     stories: Mapped[list["Story"]] = relationship(back_populates="user", cascade="all, delete-orphan")
@@ -50,8 +55,36 @@ class EmbedUsage(Base):
     count: Mapped[int] = mapped_column(Integer, default=0)
 
 
+# Hikaye gorunurlugu (Faz 2):
+#   private  -> yalnizca sahibi (VARSAYILAN; hicbir public uctan SIZMAZ)
+#   unlisted -> linki bilen herkes (listelenmez, aramada cikmaz)
+#   public   -> ana sayfada ve aramada gorunur
+VISIBILITY_PRIVATE = "private"
+VISIBILITY_UNLISTED = "unlisted"
+VISIBILITY_PUBLIC = "public"
+VISIBILITIES = (VISIBILITY_PRIVATE, VISIBILITY_UNLISTED, VISIBILITY_PUBLIC)
+# Auth'suz okunabilen gorunurlukler (private ASLA burada olmamali)
+READABLE_WITHOUT_OWNER = (VISIBILITY_UNLISTED, VISIBILITY_PUBLIC)
+
+# Arama vektoru: baslik + aciklama. Sorgu tarafi da AYNI ifadeyi kullanmali, yoksa Postgres
+# indeksi kullanamaz (ifade indeksleri birebir eslesme ister).
+SEARCH_VECTOR_SQL = "to_tsvector('simple', title || ' ' || coalesce(description, ''))"
+
+
 class Story(Base):
     __tablename__ = "stories"
+    __table_args__ = (
+        # Ana sayfa: "son yayimlananlar" (visibility + published_at birlikte taranir)
+        Index("ix_stories_visibility_published", "visibility", "published_at"),
+        # Etiket filtresi: text[] uzerinde kapsama sorgulari
+        Index("ix_stories_tags_gin", "tags", postgresql_using="gin"),
+        # Tam metin arama: baslik + aciklama uzerinde GIN. 'simple' KONFIGURASYONU BILINCLI
+        # SECIM — platform cok dilli hikaye destekliyor (bkz. prompts CRITICAL LANGUAGE RULE);
+        # tek bir dilin stemmer'ini cok dilli korpusa uygulamak sessiz bir dogruluk hatasidir.
+        # Hedef kitle ingilizce agirlikli oldugu kanitlanirsa 'english'e gecis tek migration
+        # (ve tam yeniden indeksleme) meselesi.
+        Index("ix_stories_search_gin", text(SEARCH_VECTOR_SQL), postgresql_using="gin"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
@@ -62,6 +95,22 @@ class Story(Base):
     # artirir ama modeli taklide iter, yaraticiligi dusurur ve token maliyetini katlar;
     # sureklilik zayifsa cozum daha cok ham bolum degil daha iyi retrieval.
     last_chapters_full_text: Mapped[int] = mapped_column(Integer, nullable=False, server_default="2")
+
+    # --- Okuyucu platformu (Faz 2) ---
+    # VARSAYILAN private: yayimlama bilincli bir eylem olmali, kaza eseri degil.
+    visibility: Mapped[str] = mapped_column(String(16), nullable=False, server_default=VISIBILITY_PRIVATE)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tags: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False, server_default="{}")
+    # public + is_adult KOMBINASYONU YASAK (operator TR'de, 5651). Kolon ileri icin rezerve.
+    is_adult: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    # Cold-start: bos siteye gelen ziyaretci kaliteyi anahtar yapistirmadan gorsun.
+    # YALNIZCA admin isaretleyebilir; sunucu anahtariyla uretilir.
+    is_showcase: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    # user|server — "server" yolu SIMDILIK yalnizca showcase+admin'de aktif (kredi katmani sonra)
+    key_source: Mapped[str] = mapped_column(String(16), nullable=False, server_default="user")
+    # Ilk yayimlanma ani. Yalnizca NULL iken doldurulur: yayindan alip geri koyarak
+    # ana sayfada one cikma (gaming) olmasin.
+    published_at: Mapped[datetime | None] = mapped_column(nullable=True)
     # Yazar bolum duzenledikten sonra bir SONRAKI uretime tasinacak notlar (JSON listesi)
     pending_edit_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
@@ -90,6 +139,56 @@ class Story(Base):
     prompt_items: Mapped[list["PromptItem"]] = relationship(
         cascade="all, delete-orphan", order_by="PromptItem.order, PromptItem.id", lazy="selectin"
     )
+
+
+class Comment(Base):
+    """Bolum bazli yorum — DUZ LISTE, thread YOK (bilincli: moderasyon yuku ve UI karmasikligi
+    launch icin gereksiz). Yazarin kendi yorumu rozetlenir ve sabitlenebilir."""
+
+    __tablename__ = "comments"
+    __table_args__ = (
+        # Bolum sayfasi: sabitlenenler once, sonra kronolojik (sayfali)
+        Index("ix_comments_chapter_created", "chapter_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    chapter_id: Mapped[int] = mapped_column(ForeignKey("chapters.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    body: Mapped[str] = mapped_column(Text)
+    # Yalnizca hikayenin YAZARI kendi yorumunu sabitleyebilir
+    is_author_pinned: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class ChapterVote(Base):
+    """Bolum begenisi: tek tik, geri alinabilir. UNIQUE(chapter_id, user_id) cift oyu
+    VERITABANI SEVIYESINDE engeller — yaris kosulunda bile ikinci oy atilamaz.
+    Yildiz/puan YOK: tek boyutlu begeni kotuye kullanimi zorlastirir ve okuru yormaz."""
+
+    __tablename__ = "chapter_votes"
+    __table_args__ = (UniqueConstraint("chapter_id", "user_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    chapter_id: Mapped[int] = mapped_column(ForeignKey("chapters.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class Report(Base):
+    """Kullanici bildirimi (Faz 4 moderasyon araclari bunu okuyacak). target_type ile
+    hedef turu ayrilir (story|chapter|comment); FK KOYULMAZ cunku farkli tablolari
+    isaret ediyor — silinen hedefin raporu kayit olarak kalsin."""
+
+    __tablename__ = "reports"
+    __table_args__ = (Index("ix_reports_status_created", "status", "created_at"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    target_type: Mapped[str] = mapped_column(String(16))  # story | chapter | comment
+    target_id: Mapped[int] = mapped_column(Integer)
+    reporter_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    reason: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="open")
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
 class PromptItem(Base):

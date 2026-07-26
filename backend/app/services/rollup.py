@@ -117,6 +117,10 @@ async def ensure_rollup(db: AsyncSession, story: Story, ctx: LlmCtx) -> int:
         payload = await _summaries_for_range(db, story.id, start, end)
         if not payload:
             continue  # bu aralikta hic ozet yok (ozet telafisi once tamamlansin)
+        # LLM cagrisindan ONCE okuma islemini KAPAT. Aksi halde SQLAlchemy'nin acilan
+        # transaction'i ag cagrisi boyunca (dakikalarca, retry'lerle) acik kalir ve tablo
+        # kilitlerini tutar: bu, DDL'i (migration) ve baska istekleri bloke eder.
+        await db.commit()
         summary = await _compress(ctx, ARC_SUMMARY_PROMPT, payload)
         if not summary:
             continue
@@ -142,6 +146,7 @@ async def ensure_rollup(db: AsyncSession, story: Story, ctx: LlmCtx) -> int:
                 payload = "\n\n".join(
                     f"Chapters {a.start_index}-{a.end_index}: {a.summary}" for a in parts
                 )[:ARC_INPUT_CHAR_CAP]
+                await db.commit()  # LLM cagrisi boyunca transaction acik kalmasin (yukariya bkz.)
                 summary = await _compress(ctx, BACKGROUND_SUMMARY_PROMPT, payload)
                 if summary:
                     # Kapsami degistiyse eskisini sil (unique: story_id+level+start_index)

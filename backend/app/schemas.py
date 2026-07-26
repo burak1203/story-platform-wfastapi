@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
@@ -8,6 +10,9 @@ from .models import Story
 MAX_PROMPT_LEN = 5_000     # kullanici talimatlari (konu, hamle, style/negative)
 MAX_PROMPT_ITEM_LEN = 1_000  # tek bir talimat maddesi
 MAX_PROMPT_ITEMS = 50        # hikaye basina azami madde (prompt sisirme onlemi)
+MAX_DESCRIPTION_LEN = 2_000  # yayin aciklamasi (ana sayfa/arama)
+MAX_TAGS = 10                # hikaye basina azami etiket
+MAX_TAG_LEN = 32
 MAX_CHAPTER_LEN = 60_000   # bolum metni
 MAX_SUMMARY_LEN = 2_000
 MAX_NAME_LEN = 120
@@ -69,6 +74,25 @@ class UpdateStorySettingsRequest(CamelModel):
     ayri madde uclarinda (prompt-items)."""
 
     last_chapters_full_text: int = Field(ge=LAST_CHAPTERS_MIN, le=LAST_CHAPTERS_MAX)
+
+
+class UpdatePublishingRequest(CamelModel):
+    """Yayimlama ayarlari. public'e gecerken kurallar onayi ZORUNLU (rules_accepted)."""
+
+    visibility: str = Field(pattern="^(private|unlisted|public)$")
+    description: str | None = Field(default=None, max_length=MAX_DESCRIPTION_LEN)
+    tags: list[str] | None = Field(default=None, max_length=MAX_TAGS)
+    is_adult: bool = False
+    rules_accepted: bool = False
+
+
+class PublishingDto(CamelModel):
+    visibility: str
+    description: str | None
+    tags: list[str]
+    is_adult: bool
+    is_showcase: bool
+    published_at: datetime | None
 
 
 class PromptItemDto(CamelModel):
@@ -140,6 +164,7 @@ class StoryDetailResponse(CamelModel):
     action_count: int
     last_chapters_full_text: int
     prompt_items: list[PromptItemDto]
+    publishing: PublishingDto
     characters: list[ElementDto]
     locations: list[ElementDto]
     items: list[ElementDto]
@@ -191,6 +216,14 @@ def story_detail(story: Story) -> StoryDetailResponse:
             PromptItemDto(id=p.id, kind=p.kind, text=p.text, enabled=p.enabled, order=p.order)
             for p in sorted(story.prompt_items, key=lambda p: (p.order, p.id))
         ],
+        publishing=PublishingDto(
+            visibility=story.visibility,
+            description=story.description,
+            tags=list(story.tags or []),
+            is_adult=story.is_adult,
+            is_showcase=story.is_showcase,
+            published_at=story.published_at,
+        ),
         characters=[
             ElementDto(id=c.id, name=c.name, description=c.description, status=c.status)
             for c in story.characters
