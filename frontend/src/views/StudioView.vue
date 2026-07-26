@@ -237,14 +237,20 @@ const elementSections = computed(() => [
       </div>
 
       <!-- Yazım Ayarları -->
-      <div class="mb-4 border border-slate-700 rounded-lg">
+      <!-- shrink-0 + baslikta shrink-0: panel acikken bolum ozetleri listesi tarafindan ezilmesin -->
+      <div class="mb-4 border border-slate-700 rounded-lg flex flex-col min-h-0 shrink-0">
         <button
           @click="showSettings = !showSettings"
-          class="w-full text-left px-4 py-2 text-sm font-semibold text-slate-300 hover:text-amber-500 transition-colors"
+          class="w-full text-left px-4 py-2 text-sm font-semibold text-slate-300 hover:text-amber-500 transition-colors shrink-0"
         >
           ⚙️ Yazım Ayarları {{ showSettings ? '▾' : '▸' }}
         </button>
-        <div v-if="showSettings" class="p-3 pt-0 flex flex-col gap-4">
+        <!-- Kendi kaydirmasi: madde sayisi artinca panel tasip kirpilmasin (sol panel
+             overflow-hidden icinde; kaydirma olmadan asagidaki negatif talimatlara ulasilamiyor) -->
+        <div
+          v-if="showSettings"
+          class="p-3 pt-0 flex flex-col gap-4 overflow-y-auto max-h-[55vh] min-h-0"
+        >
           <!-- Talimat maddeleri: tek tek açılıp kapanır, sıralanır -->
           <div v-for="section in promptSections" :key="section.kind" class="flex flex-col gap-2">
             <label class="text-xs text-slate-500">{{ section.title }}</label>
@@ -350,7 +356,7 @@ const elementSections = computed(() => [
       </div>
 
       <!-- Bölüm Özetleri -->
-      <h2 class="text-xs uppercase tracking-wider text-slate-500 font-semibold mb-3">
+      <h2 class="text-xs uppercase tracking-wider text-slate-500 font-semibold mb-3 shrink-0">
         Bölüm Özetleri
       </h2>
       <div class="flex-1 overflow-y-auto pr-2 flex flex-col gap-3">
