@@ -58,6 +58,27 @@ async def get_current_user(request: Request, db: AsyncSession = Depends(get_db))
     return user
 
 
+async def get_optional_user(
+    request: Request, db: AsyncSession = Depends(get_db)
+) -> User | None:
+    """Girisi ZORUNLU KILMAYAN uclar icin (public okuma). Token yoksa, bozuksa ya da suresi
+    dolmussa 401 ATMAZ, None doner: okuma girissiz de calisan bir islem — oturumun suresi
+    doldu diye okurun sayfasi kirilmamali. Yalnizca "bu okur bunu begenmis mi" gibi
+    kisisellestirme icin kullanilir, YETKI KARARI icin ASLA (yetki gereken uclar
+    get_current_user kullanir)."""
+    token = _extract_token(request)
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, settings.jwt_secret, algorithms=[ALGORITHM])
+        username: str | None = payload.get("sub")
+    except jwt.PyJWTError:
+        return None
+    if not username:
+        return None
+    return (await db.execute(select(User).where(User.username == username))).scalar_one_or_none()
+
+
 def get_llm_ctx(request: Request) -> LlmCtx:
     """BYOK: uretim yapan uclarda kullanicinin LLM ayarlarini header'dan alir. Sunucuda
     varsayilan YOK: base URL + model + anahtar UCU DE gelmeli; eksikse 401 llm_config_missing

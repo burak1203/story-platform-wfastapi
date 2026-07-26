@@ -13,6 +13,7 @@ MAX_PROMPT_ITEMS = 50        # hikaye basina azami madde (prompt sisirme onlemi)
 MAX_DESCRIPTION_LEN = 2_000  # yayin aciklamasi (ana sayfa/arama)
 MAX_TAGS = 10                # hikaye basina azami etiket
 MAX_TAG_LEN = 32
+MAX_COMMENT_LEN = 2_000      # okuyucu yorumu
 MAX_CHAPTER_LEN = 60_000   # bolum metni
 MAX_SUMMARY_LEN = 2_000
 MAX_NAME_LEN = 120
@@ -239,6 +240,9 @@ class PublicChapterView(CamelModel):
     index: int
     content: str
     like_count: int
+    # Istegi yapan kullanici bu bolumu begenmis mi. Girissiz okurda her zaman False —
+    # kalp ikonunun dolu/bos gosterilmesi icin (ayri istek atmaya gerek kalmasin).
+    liked: bool
     previous_index: int | None
     next_index: int | None
 
@@ -248,6 +252,40 @@ class PublicAuthorProfile(CamelModel):
     joined_at: datetime
     total_likes: int
     stories: list[PublicStoryCard]
+
+
+class ChapterLikeState(CamelModel):
+    """Begeni uclarinin yaniti: guncel sayac + istegi yapanin durumu."""
+
+    like_count: int
+    liked: bool
+
+
+class PublicCommentDto(CamelModel):
+    """GUVENLIK: yorumcudan yalnizca KULLANICI ADI disari cikar. E-posta, kullanici id'si,
+    kayit tarihi, is_admin gibi hicbir hesap verisi buraya EKLENMEZ — silme/sabitleme
+    yetkisini frontend kullanici adini karsilastirarak anlar, id'ye ihtiyaci yok."""
+
+    id: int
+    author: str
+    body: str
+    # Yorumcu hikayenin YAZARI mi (rozet icin)
+    is_author: bool
+    is_pinned: bool
+    created_at: datetime
+
+
+class PublicCommentPage(CamelModel):
+    total: int
+    comments: list[PublicCommentDto]
+
+
+class CreateCommentRequest(CamelModel):
+    body: str = Field(min_length=1, max_length=MAX_COMMENT_LEN)
+
+
+class PinCommentRequest(CamelModel):
+    pinned: bool
 
 
 def _joined_summary(story: Story) -> str | None:

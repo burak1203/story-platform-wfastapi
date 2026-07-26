@@ -23,6 +23,13 @@ SEARCH_LIMIT = "20/minute"     # embed harcayan arama (yazarin hikaye ici aramas
 PUBLIC_READ_LIMIT = "120/minute"
 PUBLIC_SEARCH_LIMIT = "30/minute"
 
+# Etkilesim (giris ISTER, dolayisiyla kullanici basina sayilir):
+# Yorum SIKI — ilk gercek kullanici-uretimi icerik, spam'in girecegi kapi burasi.
+# Begeni daha gevsek: okur bolum bolum gezerken serbestce begenip geri alabilmeli,
+# ama tek tikla sayac sismesin diye yine de tavanli.
+COMMENT_WRITE_LIMIT = "5/minute"
+VOTE_LIMIT = "60/minute"
+
 
 def user_or_ip(request: Request) -> str:
     auth_header = request.headers.get("Authorization", "")

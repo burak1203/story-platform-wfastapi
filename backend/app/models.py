@@ -155,7 +155,9 @@ class Comment(Base):
     chapter_id: Mapped[int] = mapped_column(ForeignKey("chapters.id", ondelete="CASCADE"), index=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     body: Mapped[str] = mapped_column(Text)
-    # Yalnizca hikayenin YAZARI kendi yorumunu sabitleyebilir
+    # Sabitleme yetkisi YALNIZCA hikayenin yazarindadir; kendi yorumunu da bir okurun
+    # yorumunu da tepeye tasiyabilir. Yorumcunun kendisi sabitleyemez — aksi halde herkes
+    # kendi yorumunu tepeye tasir ve sabitleme anlamini yitirir.
     is_author_pinned: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
