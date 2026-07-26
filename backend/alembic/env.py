@@ -21,9 +21,12 @@ from app import models  # noqa: E402,F401 - tablolarin metadata'ya kaydolmasi ic
 config.set_main_option("sqlalchemy.url", settings.database_url)
 
 # Interpret the config file for Python logging.
-# This line sets up loggers basically.
+# disable_existing_loggers=False KRITIK: varsayilan True, yani bu cagri o ana kadar
+# kurulmus TUM logger'lari (uvicorn.error dahil) susturur. Migration'lar acilista
+# calistigi icin (bkz. database.init_db) bunun sonucu sudur: acilis hatasi olustugunda
+# konteyner HICBIR sey yazmadan olur ve sonsuz restart doner — sunucuda teshis imkansiz.
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # autogenerate icin model metadata'si
 target_metadata = Base.metadata

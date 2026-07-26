@@ -1,6 +1,15 @@
 # Production stack: caddy (80/443) -> backend (kapali) -> postgres (kapali)
 # Kullanim: sunucuda .env.prod olustur (bkz. .env.prod.example), sonra:
 #   docker compose -f docker-compose.prod.yml up -d --build
+
+# Proje adi ACIKCA verilir. Verilmezse compose dizin adini kullanir; o zaman dev
+# (docker-compose.yml) ve prod ayni projeye duser ve ikisinde de "postgres" servisi
+# oldugu icin prod'u ayaga kaldirmak DEV konteynerini siler. Lokalde prod stack'ini
+# denerken bu can sikici, ayni anda ikisini calistirmak da imkansiz olur.
+# NOT: bu ad volume onekini belirler; DEPLOY sonrasi DEGISTIRME (volume'ler yeniden
+# adlandirilir ve veri "kaybolmus" gibi gorunur).
+name: storyplatform-prod
+
 services:
   postgres:
     image: pgvector/pgvector:pg16

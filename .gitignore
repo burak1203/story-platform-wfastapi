@@ -15,7 +15,12 @@ ai-worker/__pycache__/
 .DS_Store
 
 # Production sirlari
+# .env.prod.* de kapsanir: yedek/kopya dosyalar (.env.prod.bak, .env.prod.yedek gibi)
+# ayni sirlari tasir ve en kolay bu sekilde kazara commit edilir.
 .env.prod
+.env.prod.*
+# ...ama ornek sablon (sir icermez) izlenmeye devam eder
+!.env.prod.example
 
 frontend/node_modules/*
 
