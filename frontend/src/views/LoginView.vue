@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/authStore'
+import { safeRedirect } from '@/router/redirect'
 import GoogleSignInButton from '@/components/GoogleSignInButton.vue'
 
 const router = useRouter()
+const route = useRoute()
 const authStore = useAuthStore()
 
 const username = ref('')
@@ -15,7 +17,8 @@ const handleLogin = async () => {
 
   try {
     await authStore.login({ username: username.value, password: password.value })
-    router.push('/dashboard') // Giriş başarılıysa ana panele geç
+    // Okuyucu tarafindan "begen/yorum yap" diye yonlendirildiyse geldigi yere don
+    router.push(safeRedirect(route.query.redirect))
   } catch (error) {
     // Hata yönetimi authStore içinde yapılıyor, ekrana yansıyacak
   }
@@ -68,7 +71,10 @@ const handleLogin = async () => {
 
       <div class="mt-6 text-center text-sm text-slate-400">
         Hesabın yok mu?
-        <RouterLink to="/register" class="text-amber-500 hover:underline">Kayıt Ol</RouterLink>
+        <RouterLink
+          :to="{ path: '/register', query: route.query.redirect ? { redirect: route.query.redirect } : {} }"
+          class="text-amber-500 hover:underline"
+        >Kayıt Ol</RouterLink>
       </div>
     </div>
   </div>

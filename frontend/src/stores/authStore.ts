@@ -4,6 +4,24 @@ import type { RegisterRequest, AuthenticationRequest, AuthenticationResponse } f
 // Relative /api: dev'de Vite proxy'si, prod'da Caddy backend'e yonlendirir
 const API_URL = '/api/auth'
 
+/**
+ * JWT'nin payload'undaki kullanici adini okur (imza DOGRULANMAZ).
+ * Yalnizca ARAYUZ icin: "sil"/"sabitle" dugmesini kime gosterecegimizi bilmek gibi.
+ * Yetki kararlari SUNUCUDA verilir (403 doner) — buradaki deger kurcalansa bile
+ * kullanici backend'de yetkisi olmayan bir sey yapamaz.
+ */
+function usernameFromToken(token: string | null): string | null {
+  if (!token) return null
+  try {
+    const payload = token.split('.')[1]
+    if (!payload) return null
+    const json = atob(payload.replace(/-/g, '+').replace(/_/g, '/'))
+    return JSON.parse(json).sub ?? null
+  } catch {
+    return null
+  }
+}
+
 export const useAuthStore = defineStore('auth', {
   state: () => ({
     token: localStorage.getItem('token') || (null as string | null),
@@ -11,6 +29,11 @@ export const useAuthStore = defineStore('auth', {
     isLoading: false,
     error: null as string | null,
   }),
+
+  getters: {
+    /** Giris yapan kullanicinin adi (yoksa null). Bkz. usernameFromToken — sadece arayuz icin. */
+    username: (state): string | null => usernameFromToken(state.token),
+  },
 
   actions: {
     // Axios'a token'ı global olarak ekleyen yardımcı metot

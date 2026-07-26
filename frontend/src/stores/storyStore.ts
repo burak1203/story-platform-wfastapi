@@ -239,6 +239,31 @@ export const useStoryStore = defineStore('story', {
       }
     },
 
+    /**
+     * Yayimlama ayarlari (F2.1 ucunun arayuz karsiligi).
+     * public'e gecerken backend kurallar onayini ZORUNLU tutar ve public+adult'u reddeder;
+     * burada tekrar dogrulamiyoruz — tek dogruluk kaynagi sunucu olsun.
+     */
+    async updatePublishing(
+      storyId: number,
+      payload: {
+        visibility: 'private' | 'unlisted' | 'public'
+        description: string | null
+        tags: string[]
+        isAdult: boolean
+        rulesAccepted: boolean
+      },
+    ) {
+      this.error = null
+      try {
+        const response = await axios.put(`${API_URL}/${storyId}/publishing`, payload)
+        this.story = response.data
+      } catch (err: any) {
+        this.error = err.response?.data?.detail || err.message || 'Yayımlama ayarları kaydedilemedi.'
+        throw err
+      }
+    },
+
     async updateSettings(storyId: number, lastChaptersFullText: number) {
       this.error = null
       try {

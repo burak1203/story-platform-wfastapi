@@ -6,6 +6,7 @@ import axios from 'axios'
 import App from './App.vue'
 import router from './router' // Router eklendi
 import { useAuthStore } from './stores/authStore' // Auth store eklendi
+import { useReaderPrefsStore } from './stores/readerPrefsStore'
 
 const app = createApp(App)
 
@@ -15,6 +16,10 @@ app.use(router) // Router'ı Vue'ya bağlıyoruz
 // Uygulama başlarken daha önceden kalan token varsa Axios'a ekle
 const authStore = useAuthStore()
 authStore.setAxiosHeader()
+
+// Okuma temasını Vue ilk boyamayı yapmadan ÖNCE uygula: görünüm içinde onMounted ile
+// yapılsaydı sayfa bir an açık temada görünüp koyuya atlardı (flash).
+useReaderPrefsStore().applyTheme()
 
 // BYOK: kullanıcının üretim ayarları (sağlayıcı + base URL + model + anahtar) yalnızca
 // tarayıcıda durur, her isteğe header olarak eklenir. Sunucuda hiçbir varsayılan yok.

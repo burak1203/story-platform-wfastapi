@@ -32,11 +32,36 @@ const router = createRouter({
       component: StudioView,
       meta: { requiresAuth: true },
     },
+    // --- Okuyucu platformu (PUBLIC) ---
+    // Bu rotalarda requiresAuth/requiresGuest meta'si YOKTUR; asagidaki guard yalnizca o
+    // iki meta'ya bakar, dolayisiyla public rotalar dogal olarak guard'in DISINDA kalir.
+    // Buraya requiresAuth eklenirse girissiz okuma kirilir.
     {
       path: '/',
-      redirect: '/dashboard',
+      name: 'home',
+      component: () => import('@/views/HomeView.vue'),
+    },
+    {
+      path: '/s/:id',
+      name: 'story',
+      component: () => import('@/views/StoryView.vue'),
+    },
+    {
+      path: '/s/:id/:index',
+      name: 'read',
+      component: () => import('@/views/ReadView.vue'),
+    },
+    {
+      path: '/u/:username',
+      name: 'author',
+      component: () => import('@/views/AuthorView.vue'),
     },
   ],
+
+  // Okuma sayfasinda geri tusuna basinca okur kaldigi yere donmeli; yeni sayfada basa git.
+  scrollBehavior(to, from, savedPosition) {
+    return savedPosition || { top: 0 }
+  },
 })
 
 // Trafik Polisi (Route Guard)
@@ -44,7 +69,8 @@ router.beforeEach((to, from, next) => {
   const authStore = useAuthStore()
 
   if (to.meta.requiresAuth && !authStore.isAuthenticated) {
-    next('/login')
+    // Girisden sonra kullaniciyi gitmek istedigi yere geri gonder
+    next({ path: '/login', query: { redirect: to.fullPath } })
   } else if (to.meta.requiresGuest && authStore.isAuthenticated) {
     next('/dashboard')
   } else {

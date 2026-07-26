@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/authStore'
+import { safeRedirect } from '@/router/redirect'
 import GoogleSignInButton from '@/components/GoogleSignInButton.vue'
 
 const router = useRouter()
+const route = useRoute()
 const authStore = useAuthStore()
 
 const username = ref('')
@@ -20,7 +22,8 @@ const handleRegister = async () => {
       email: email.value,
       password: password.value,
     })
-    router.push('/dashboard')
+    // Okuyucu tarafindan yonlendirildiyse geldigi yere don
+    router.push(safeRedirect(route.query.redirect))
   } catch (error) {
     // Hata store'dan okunuyor
   }
@@ -89,7 +92,10 @@ const handleRegister = async () => {
 
       <div class="mt-6 text-center text-sm text-slate-400">
         Zaten hesabın var mı?
-        <RouterLink to="/login" class="text-amber-500 hover:underline">Giriş Yap</RouterLink>
+        <RouterLink
+          :to="{ path: '/login', query: route.query.redirect ? { redirect: route.query.redirect } : {} }"
+          class="text-amber-500 hover:underline"
+        >Giriş Yap</RouterLink>
       </div>
     </div>
   </div>

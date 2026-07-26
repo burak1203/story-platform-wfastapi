@@ -3,7 +3,7 @@ import { ref, computed, onMounted, nextTick, watch, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { useStoryStore } from '@/stores/storyStore'
 import { useLlmKeyStore } from '@/stores/llmKeyStore'
-import type { ElementDto, ElementKind, PromptItemDto, PromptItemKind } from '@/types'
+import type { ElementDto, ElementKind, PromptItemDto, PromptItemKind, Visibility } from '@/types'
 
 const store = useStoryStore()
 const llmKeyStore = useLlmKeyStore()
@@ -169,6 +169,58 @@ const saveLastChapters = async () => {
   await store.updateSettings(storyId.value, lastChaptersDraft.value)
   settingsSaved.value = true
   setTimeout(() => (settingsSaved.value = false), 2000)
+}
+
+// --- Yayımlama (okuyucu platformu) ---
+// F2.1'de uç eklendi ama arayüze bağlanmamıştı: yazar tarayıcıdan hikayesini
+// yayımlayamıyordu, dolayısıyla okuyucu tarafı boş kalıyordu.
+const showPublishing = ref(false)
+const pubVisibility = ref<Visibility>('private')
+const pubDescription = ref('')
+const pubTags = ref('')
+const pubIsAdult = ref(false)
+const pubRulesAccepted = ref(false)
+const pubSaved = ref(false)
+const pubError = ref<string | null>(null)
+
+// Hikaye yüklenince/değişince formu sunucudaki mevcut duruma eşitle
+watch(
+  () => store.story?.publishing,
+  (publishing) => {
+    if (!publishing) return
+    pubVisibility.value = publishing.visibility
+    pubDescription.value = publishing.description || ''
+    pubTags.value = publishing.tags.join(', ')
+    pubIsAdult.value = publishing.isAdult
+    // Zaten yayındaysa kuralları daha önce onaylamış demektir
+    pubRulesAccepted.value = publishing.visibility === 'public'
+  },
+  { immediate: true },
+)
+
+const publicUrl = computed(() =>
+  store.story ? `${window.location.origin}/s/${store.story.id}` : '',
+)
+
+const savePublishing = async () => {
+  pubError.value = null
+  try {
+    await store.updatePublishing(storyId.value, {
+      visibility: pubVisibility.value,
+      description: pubDescription.value.trim() || null,
+      tags: pubTags.value
+        .split(',')
+        .map((t) => t.trim())
+        .filter(Boolean)
+        .slice(0, 10),
+      isAdult: pubIsAdult.value,
+      rulesAccepted: pubRulesAccepted.value,
+    })
+    pubSaved.value = true
+    setTimeout(() => (pubSaved.value = false), 2000)
+  } catch (err: any) {
+    pubError.value = err?.response?.data?.detail || 'Kaydedilemedi.'
+  }
 }
 
 // --- Varlıklar ---
@@ -352,6 +404,94 @@ const elementSections = computed(() => [
               hafıza aramasıdır. (1-5, varsayılan 2)
             </p>
           </div>
+        </div>
+      </div>
+
+      <!-- Yayımlama: hikayeyi okuyucu platformunda görünür kılar -->
+      <div class="mb-4 border border-slate-700 rounded-lg flex flex-col min-h-0 shrink-0">
+        <button
+          @click="showPublishing = !showPublishing"
+          class="w-full text-left px-4 py-2 text-sm font-semibold text-slate-300 hover:text-amber-500 transition-colors shrink-0"
+        >
+          🌍 Yayımlama
+          <span class="text-xs font-normal text-slate-500">
+            ({{
+              store.story?.publishing?.visibility === 'public'
+                ? 'herkese açık'
+                : store.story?.publishing?.visibility === 'unlisted'
+                  ? 'liste dışı'
+                  : 'özel'
+            }})
+          </span>
+          {{ showPublishing ? '▾' : '▸' }}
+        </button>
+
+        <div v-if="showPublishing" class="p-3 pt-0 flex flex-col gap-3 overflow-y-auto max-h-[55vh] min-h-0">
+          <div class="flex flex-col gap-1">
+            <label class="text-xs text-slate-500">Görünürlük</label>
+            <select
+              v-model="pubVisibility"
+              class="bg-slate-900 border border-slate-700 rounded px-2 py-1.5 text-xs focus:outline-none focus:border-amber-500"
+            >
+              <option value="private">Özel — yalnızca sen</option>
+              <option value="unlisted">Liste dışı — linki bilen okur</option>
+              <option value="public">Herkese açık — ana sayfada ve aramada</option>
+            </select>
+          </div>
+
+          <div class="flex flex-col gap-1">
+            <label class="text-xs text-slate-500">Açıklama (okuyucu kartında görünür)</label>
+            <textarea
+              v-model="pubDescription"
+              rows="3"
+              maxlength="2000"
+              class="bg-slate-900 border border-slate-700 rounded p-2 text-xs focus:outline-none focus:border-amber-500 resize-none"
+            ></textarea>
+          </div>
+
+          <div class="flex flex-col gap-1">
+            <label class="text-xs text-slate-500">Etiketler (virgülle ayır, en fazla 10)</label>
+            <input
+              v-model="pubTags"
+              type="text"
+              placeholder="fantasy, adventure"
+              class="bg-slate-900 border border-slate-700 rounded px-2 py-1.5 text-xs focus:outline-none focus:border-amber-500"
+            />
+          </div>
+
+          <label class="flex items-start gap-2 text-xs text-slate-400">
+            <input v-model="pubIsAdult" type="checkbox" class="mt-0.5" />
+            <span>Yetişkin içerik. <b class="text-slate-500">Bu işaretliyken herkese açık yayımlanamaz.</b></span>
+          </label>
+
+          <label v-if="pubVisibility === 'public'" class="flex items-start gap-2 text-xs text-slate-400">
+            <input v-model="pubRulesAccepted" type="checkbox" class="mt-0.5" />
+            <span>İçerik kurallarını okudum ve kabul ediyorum.</span>
+          </label>
+
+          <p v-if="pubError" class="text-xs text-red-400 leading-relaxed">{{ pubError }}</p>
+
+          <button
+            @click="savePublishing"
+            class="bg-amber-600 hover:bg-amber-500 text-slate-900 text-xs font-bold px-4 py-1.5 rounded transition-colors"
+          >
+            {{ pubSaved ? '✓ Kaydedildi' : 'Kaydet' }}
+          </button>
+
+          <a
+            v-if="store.story?.publishing?.visibility !== 'private'"
+            :href="publicUrl"
+            target="_blank"
+            rel="noopener"
+            class="text-xs text-amber-500 hover:underline break-all"
+          >
+            Okuyucu sayfasını aç: {{ publicUrl }}
+          </a>
+
+          <p class="text-xs text-slate-600 leading-relaxed">
+            Yayımlanan hikayede yeni bölümler üretildikçe okurlara görünür — ayrı bir
+            "yayımla" adımı yok.
+          </p>
         </div>
       </div>
 

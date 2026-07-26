@@ -1,13 +1,15 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import axios from 'axios'
 import { useAuthStore } from '@/stores/authStore'
+import { safeRedirect } from '@/router/redirect'
 
 // Sunucuda GOOGLE_OAUTH_CLIENT_ID tanimli degilse buton hic gorunmez
 const enabled = ref(false)
 const container = ref<HTMLElement | null>(null)
 const router = useRouter()
+const route = useRoute()
 const authStore = useAuthStore()
 
 const GSI_SRC = 'https://accounts.google.com/gsi/client'
@@ -27,7 +29,8 @@ function loadGsiScript(): Promise<void> {
 async function onCredential(response: { credential: string }) {
   try {
     await authStore.googleLogin(response.credential)
-    router.push('/dashboard')
+    // Okuyucu tarafindan yonlendirildiyse geldigi yere don
+    router.push(safeRedirect(route.query.redirect))
   } catch {
     // Hata authStore.error uzerinden ekranda gosterilir
   }
