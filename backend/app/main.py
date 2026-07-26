@@ -8,7 +8,7 @@ from slowapi.errors import RateLimitExceeded
 from .config import settings
 from .database import init_db
 from .ratelimit import limiter, rate_limit_handler
-from .routers import auth, elements, llm, stories
+from .routers import auth, elements, llm, public, stories
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -35,6 +35,7 @@ app.include_router(auth.router)
 app.include_router(stories.router)
 app.include_router(elements.router)
 app.include_router(llm.router)
+app.include_router(public.router)
 
 
 @app.get("/api/health")

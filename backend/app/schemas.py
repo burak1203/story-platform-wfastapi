@@ -185,6 +185,71 @@ class SearchHit(CamelModel):
     window: list[SearchWindowChapter]
 
 
+# --- Okuyucu (public) DTO'lari -------------------------------------------------------------
+# GUVENLIK: bu siniflar SIFIRDAN, alan alan yazilmistir. story_detail/StoryDetailResponse
+# BILEREK yeniden kullanilmaz — "sunu cikar" mantigi, yarin yazar tarafina yeni bir alan
+# eklendiginde onu sessizce okuyucuya sizdirir. Buraya bir alan ancak ELLE eklenerek girer.
+# Okuyucuya ASLA gitmeyecekler: initial_prompt, prompt_items (style/negative), pending_edit_notes,
+# characters/locations/items, events, chunks, arcs, token muhasebesi, chapter.summary,
+# last_chapters_full_text, key_source, user_id.
+
+
+class PublicStoryCard(CamelModel):
+    """Ana sayfa / arama / yazar profili liste ogesi."""
+
+    id: int
+    title: str
+    description: str | None
+    tags: list[str]
+    author: str
+    chapter_count: int
+    like_count: int
+    published_at: datetime | None
+
+
+class PublicChapterRef(CamelModel):
+    """Hikaye sayfasindaki bolum listesi ogesi (metin YOK — okuma ucundan gelir)."""
+
+    index: int
+    like_count: int
+    comment_count: int
+
+
+class PublicStoryDetail(CamelModel):
+    id: int
+    title: str
+    description: str | None
+    tags: list[str]
+    author: str
+    # public | unlisted — private buraya ASLA ulasamaz (sorgu seviyesinde elenir)
+    visibility: str
+    is_showcase: bool
+    published_at: datetime | None
+    chapter_count: int
+    like_count: int
+    chapters: list[PublicChapterRef]
+
+
+class PublicChapterView(CamelModel):
+    """Okuma sayfasi: yalnizca bolum METNI ve gezinme bilgisi."""
+
+    story_id: int
+    story_title: str
+    author: str
+    index: int
+    content: str
+    like_count: int
+    previous_index: int | None
+    next_index: int | None
+
+
+class PublicAuthorProfile(CamelModel):
+    username: str
+    joined_at: datetime
+    total_likes: int
+    stories: list[PublicStoryCard]
+
+
 def _joined_summary(story: Story) -> str | None:
     joined = "\n\n".join(f"Bölüm {c.index}: {c.summary.strip()}" for c in story.chapters if c.summary)
     return joined or None
