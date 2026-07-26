@@ -13,9 +13,14 @@ from dataclasses import dataclass
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI, RateLimitError
 
 from ..config import settings
-from .json_utils import parse_llm_json
+from .json_utils import coverage_ratio, parse_llm_json
 
 logger = logging.getLogger(__name__)
+
+# Ayiklanan JSON, modelin urettigi ham metnin en az bu kadarini kapsamali. Altina duserse
+# ayristirma sirasinda metin DUSMUS demektir (bkz. coverage_ratio) -> yeniden denenir.
+# 0.55: normal bir cevapta oran ~0.9+; kirpilmis bir cevapta ~0.3 civari olur.
+MIN_JSON_COVERAGE = 0.55
 
 # Ucretsiz kotayi ve aninda gelen es zamanli istekleri dizginlemek icin global limit
 llm_semaphore = asyncio.Semaphore(settings.llm_concurrency)
@@ -166,8 +171,10 @@ async def chat_json_with_usage(ctx: LlmCtx, model: str, system: str, user: str, 
                 )
             return response
 
-        # Model gecerli JSON uretmezse bir kez daha sans ver (onarim da tutmazsa)
+        # Model gecerli JSON uretmezse VEYA ayristirma modelin yazdiginin buyuk kismini
+        # dusurdukse bir kez daha sans ver.
         last_error: Exception | None = None
+        best: tuple[dict, LlmUsage, float] | None = None
         for attempt in range(2):
             response = await _with_retry(call, f"LLM cagrisi ({model})")
             choice = response.choices[0]
@@ -175,10 +182,35 @@ async def chat_json_with_usage(ctx: LlmCtx, model: str, system: str, user: str, 
                 logger.warning("LLM cevabi max_tokens sinirinda kesildi; JSON onarimi denenecek.")
             raw = choice.message.content or ""
             try:
-                return parse_llm_json(raw), _extract_usage(response)
+                parsed = parse_llm_json(raw)
             except ValueError as exc:
                 last_error = exc
                 logger.warning("LLM ciktisi JSON olarak ayiklanamadi (deneme %d/2)", attempt + 1)
+                continue
+
+            usage = _extract_usage(response)
+            ratio = coverage_ratio(parsed, raw)
+            if ratio >= MIN_JSON_COVERAGE:
+                return parsed, usage
+            # SESSIZ KAYIP: JSON "ayiklandi" ama modelin yazdiginin buyuk kismi dustu.
+            # Ham cevabi logla (kullanicinin ANAHTARI degil, MODELIN CIKTISI — sir icermez)
+            # ki tetikleyici kalip tespit edilebilsin; sonra yeniden dene.
+            logger.warning(
+                "LLM ciktisinin yalnizca %%%.0f'i ayiklanabildi (deneme %d/2) — bolum kirpilmis "
+                "olurdu, yeniden deneniyor. Ham cevap (ilk 3000 krk): %s",
+                ratio * 100, attempt + 1, raw[:3000],
+            )
+            if best is None or ratio > best[2]:
+                best = (parsed, usage, ratio)
+
+        if best is not None:
+            # Iki deneme de eksik kaldi: elde en iyisini dondur (bos donmekten iyi) ama
+            # kaydi ACIKCA isaretle — sessizce kirpik bolum kaydetme.
+            logger.error(
+                "LLM ciktisi iki denemede de tam ayiklanamadi (en iyi kapsama %%%.0f); "
+                "bolum eksik kaydediliyor.", best[2] * 100,
+            )
+            return best[0], best[1]
         raise last_error
     finally:
         await client.close()

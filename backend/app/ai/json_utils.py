@@ -38,6 +38,22 @@ def _extract_brace_block(raw_text: str) -> str | None:
     return raw_text[start_idx:]
 
 
+def coverage_ratio(parsed: dict, raw_text: str) -> float:
+    """Ayiklanan JSON, modelin URETTIGI metnin ne kadarini kapsiyor? 1.0'a yakin = her sey
+    alindi; dusuk = ayristirma sirasinda modelin yazdiginin bir kismi SESSIZCE DUSTU.
+
+    Neden gerekli: bozuk JSON'da json_repair "basarili" doner ama string'i erken kapatip
+    gerisini atabilir. O durumda hata firlamaz, log cikmaz — bolum kirpilmis halde kaydedilir
+    (kullanici "2 cumle geldi, devami yok" diye gorur). Bu oran o sessiz kaybi olculebilir yapar."""
+    raw = (raw_text or "").strip()
+    if not raw:
+        return 1.0
+    # Alan adlari/JSON noktalama disinda kalan GERCEK metni kiyasla
+    recovered = sum(len(v) for v in parsed.values() if isinstance(v, str))
+    recovered += len(json.dumps([v for v in parsed.values() if not isinstance(v, str)], ensure_ascii=False))
+    return min(1.0, recovered / len(raw))
+
+
 def parse_llm_json(raw_text: str) -> dict:
     """LLM ciktisindan JSON objesi ayiklar.
 
@@ -50,7 +66,8 @@ def parse_llm_json(raw_text: str) -> dict:
     """
     candidates: list[str] = []
 
-    match = re.search(r"```(?:json)?\s*(.*?)\s*```", raw_text, re.DOTALL)
+    # GREEDY (.*): icerikte ``` gecerse non-greedy desen blogu erken kapatip metni kirpardi
+    match = re.search(r"```(?:json)?\s*(.*)\s*```", raw_text, re.DOTALL)
     if match:
         candidates.append(match.group(1).strip())
 
