@@ -23,6 +23,17 @@ export interface StorySummaryResponse {
   currentSummary: string | null
 }
 
+// Yazarin kalici talimatlari: tek metin degil, sirali madde listesi (tek tek acilip kapanir)
+export type PromptItemKind = 'style' | 'negative'
+
+export interface PromptItemDto {
+  id: number
+  kind: PromptItemKind
+  text: string
+  enabled: boolean
+  order: number
+}
+
 export interface StoryDetailResponse {
   id: number
   title: string
@@ -30,8 +41,9 @@ export interface StoryDetailResponse {
   status: string
   currentSummary: string | null
   actionCount: number
-  stylePrompt: string | null
-  negativePrompt: string | null
+  /** Prompta tam metin girecek son bölüm sayısı (1-5) */
+  lastChaptersFullText: number
+  promptItems: PromptItemDto[]
   characters: ElementDto[]
   locations: ElementDto[]
   items: ElementDto[]

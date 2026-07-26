@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..ai import embeddings
 from ..ai.chunking import count_tokens, tail_by_tokens, truncate_by_tokens
-from ..ai.prompts import entity_card_tokens
+from ..ai.prompts import entity_card_tokens, last_chapters_count
 from ..models import Character, Chunk, Event, Item, Location, Story
 
 logger = logging.getLogger(__name__)
@@ -34,9 +34,9 @@ EVENT_RETRIEVAL_LIMIT = 4   # sorguya en yakin kac olay cekilsin (adim 7)
 QUERY_TAIL_TOKENS = 200     # sorguya eklenen son bolum kuyrugu (adim 1)
 RAG_TOKEN_BUDGET = 2000     # RAG blogunun TOPLAM token tavani (adim 6; olaylar dahil)
 
-# Son N bolum prompta ZATEN tam metin giriyor -> aramadan haric (adim 2). D3'te hikaye bazli
-# ayar olacak (default 2, aralik 1-5); simdilik tek yerde sabit.
-LAST_CHAPTERS_FULL_TEXT = 2
+# Son N bolum prompta ZATEN tam metin giriyor -> aramadan haric (adim 2). N artik HIKAYE
+# BAZLI ayar (D3.3): prompts.last_chapters_count TEK kaynaktir. Iki taraf ayni degeri
+# kullanmazsa ayni bolum hem tam metin hem RAG'den gelir (cift gonderim).
 
 # Dinamik onem: prompta GIREN olayin importance'i AZALAN artisla yukselir, CEIL'i asmaz.
 # new = old + (CEIL - old) * GROWTH -> her cekilis daha az ekler, hicbir sey 1.0'a kosmaz.
@@ -101,7 +101,7 @@ async def story_has_embedded_events(db: AsyncSession, story_id: int) -> bool:
 
 def _excluded_chapter_ids(story: Story) -> set[int]:
     """Son N bolumun id'leri: prompta zaten tam metin girdikleri icin aramadan cikarilir."""
-    return {c.id for c in story.chapters[-LAST_CHAPTERS_FULL_TEXT:]} if story.chapters else set()
+    return {c.id for c in story.chapters[-last_chapters_count(story):]} if story.chapters else set()
 
 
 async def embed_query(db: AsyncSession, story: Story, query: str) -> list[float]:
@@ -505,7 +505,7 @@ async def select_entity_cards(
                     distances[entity.id] = distance
         except Exception:
             logger.warning("Anlamsal entity secimi atlandi", exc_info=True)
-    for eid in _mentioned_in(candidates_pool, [c.content for c in story.chapters[-LAST_CHAPTERS_FULL_TEXT:]]):
+    for eid in _mentioned_in(candidates_pool, [c.content for c in story.chapters[-last_chapters_count(story):]]):
         tiers.setdefault(eid, 3)
 
     candidates = [e for e in candidates_pool if e.id in tiers]

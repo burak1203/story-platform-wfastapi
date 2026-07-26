@@ -1,10 +1,13 @@
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
+from .ai.prompts import LAST_CHAPTERS_MAX, LAST_CHAPTERS_MIN
 from .models import Story
 
 # Girdi tavanlari (kotuye kullanim / prompt sisirme onlemi)
 MAX_PROMPT_LEN = 5_000     # kullanici talimatlari (konu, hamle, style/negative)
+MAX_PROMPT_ITEM_LEN = 1_000  # tek bir talimat maddesi
+MAX_PROMPT_ITEMS = 50        # hikaye basina azami madde (prompt sisirme onlemi)
 MAX_CHAPTER_LEN = 60_000   # bolum metni
 MAX_SUMMARY_LEN = 2_000
 MAX_NAME_LEN = 120
@@ -62,8 +65,34 @@ class EditChapterSummaryRequest(CamelModel):
 
 
 class UpdateStorySettingsRequest(CamelModel):
-    style_prompt: str | None = Field(default=None, max_length=MAX_PROMPT_LEN)
-    negative_prompt: str | None = Field(default=None, max_length=MAX_PROMPT_LEN)
+    """Hikaye bazli uretim ayarlari. style/negative talimatlar artik burada DEGIL —
+    ayri madde uclarinda (prompt-items)."""
+
+    last_chapters_full_text: int = Field(ge=LAST_CHAPTERS_MIN, le=LAST_CHAPTERS_MAX)
+
+
+class PromptItemDto(CamelModel):
+    id: int
+    kind: str
+    text: str
+    enabled: bool
+    order: int
+
+
+class CreatePromptItemRequest(CamelModel):
+    kind: str = Field(pattern="^(style|negative)$")
+    text: str = Field(min_length=1, max_length=MAX_PROMPT_ITEM_LEN)
+
+
+class UpdatePromptItemRequest(CamelModel):
+    text: str | None = Field(default=None, max_length=MAX_PROMPT_ITEM_LEN)
+    enabled: bool | None = None
+
+
+class ReorderPromptItemsRequest(CamelModel):
+    """Maddelerin YENI sirasi: id listesi, istenen sirada. Listede olmayanlar sona alinir."""
+
+    item_ids: list[int] = Field(max_length=MAX_PROMPT_ITEMS)
 
 
 class ElementRequest(CamelModel):
@@ -109,8 +138,8 @@ class StoryDetailResponse(CamelModel):
     status: str
     current_summary: str | None
     action_count: int
-    style_prompt: str | None
-    negative_prompt: str | None
+    last_chapters_full_text: int
+    prompt_items: list[PromptItemDto]
     characters: list[ElementDto]
     locations: list[ElementDto]
     items: list[ElementDto]
@@ -157,8 +186,11 @@ def story_detail(story: Story) -> StoryDetailResponse:
         status=story.status,
         current_summary=_joined_summary(story),
         action_count=len(story.chapters),
-        style_prompt=story.style_prompt,
-        negative_prompt=story.negative_prompt,
+        last_chapters_full_text=story.last_chapters_full_text,
+        prompt_items=[
+            PromptItemDto(id=p.id, kind=p.kind, text=p.text, enabled=p.enabled, order=p.order)
+            for p in sorted(story.prompt_items, key=lambda p: (p.order, p.id))
+        ],
         characters=[
             ElementDto(id=c.id, name=c.name, description=c.description, status=c.status)
             for c in story.characters

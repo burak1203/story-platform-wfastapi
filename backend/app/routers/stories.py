@@ -10,17 +10,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..ai import embeddings
 from ..ai.client import LlmCtx
 from ..database import get_db
-from ..models import Story, User
+from ..models import PromptItem, Story, User
 from ..ai.prompts import parse_edit_notes
 from ..schemas import (
+    MAX_PROMPT_ITEM_LEN,
+    MAX_PROMPT_ITEMS,
     ContinueStoryRequest,
+    CreatePromptItemRequest,
     CreateStoryRequest,
     EditChapterRequest,
     EditChapterSummaryRequest,
+    ReorderPromptItemsRequest,
     SearchHit,
     SearchWindowChapter,
     StoryDetailResponse,
     StorySummaryResponse,
+    UpdatePromptItemRequest,
     UpdateStorySettingsRequest,
     story_detail,
     story_summary,
@@ -86,15 +91,21 @@ async def create_story(
     if not title or not prompt:
         raise HTTPException(status_code=400, detail="Başlık ve başlangıç konusu boş olamaz.")
 
-    story = Story(
-        user_id=user.id,
-        title=title,
-        status="PENDING",
-        initial_prompt=prompt,
-        style_prompt=(payload.style_prompt or "").strip() or None,
-        negative_prompt=(payload.negative_prompt or "").strip() or None,
-    )
+    story = Story(user_id=user.id, title=title, status="PENDING", initial_prompt=prompt)
     db.add(story)
+    await db.flush()  # maddelerin FK'si icin story.id gerekiyor
+    # Olusturma formundaki talimatlar ilk MADDE olarak kaydedilir (bos olanlar madde uretmez)
+    for order, (kind, raw) in enumerate(
+        (("style", payload.style_prompt), ("negative", payload.negative_prompt))
+    ):
+        text_value = (raw or "").strip()
+        if text_value:
+            db.add(
+                PromptItem(
+                    story_id=story.id, kind=kind, text=text_value[:MAX_PROMPT_ITEM_LEN],
+                    enabled=True, order=order,
+                )
+            )
     await db.commit()
     # Yeni eklenen nesnenin iliskileri yuklu degil; async'te lazy-load patladigi icin tazele
     story = await db.get(Story, story.id, populate_existing=True)
@@ -164,10 +175,105 @@ async def update_story_settings(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """Hikaye bazli uretim ayarlari. Talimat maddeleri ayri uclarda (prompt-items)."""
     story = await _get_owned_story(story_id, user, db)
-    story.style_prompt = (request.style_prompt or "").strip() or None
-    story.negative_prompt = (request.negative_prompt or "").strip() or None
+    story.last_chapters_full_text = request.last_chapters_full_text
     await db.commit()
+    story = await db.get(Story, story_id, populate_existing=True)
+    return story_detail(story)
+
+
+# --- Yazarin talimat maddeleri (D3.3): tek blob yerine sirali, tek tek acilip kapanan liste ---
+
+
+async def _get_owned_prompt_item(story_id: int, item_id: int, user: User, db: AsyncSession) -> PromptItem:
+    """Sahiplik: madde hem kullaniciya ait hikayeye hem de URL'deki hikayeye ait olmali (IDOR)."""
+    await _get_owned_story(story_id, user, db)
+    item = await db.get(PromptItem, item_id)
+    if item is None or item.story_id != story_id:
+        raise HTTPException(status_code=404, detail="Talimat maddesi bulunamadı.")
+    return item
+
+
+@router.post("/{story_id}/prompt-items", response_model=StoryDetailResponse)
+async def create_prompt_item(
+    story_id: int,
+    payload: CreatePromptItemRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    story = await _get_owned_story(story_id, user, db)
+    text_value = payload.text.strip()
+    if not text_value:
+        raise HTTPException(status_code=400, detail="Talimat boş olamaz.")
+    if len(story.prompt_items) >= MAX_PROMPT_ITEMS:
+        raise HTTPException(
+            status_code=400, detail=f"En fazla {MAX_PROMPT_ITEMS} talimat maddesi ekleyebilirsin."
+        )
+    next_order = max((p.order for p in story.prompt_items), default=-1) + 1
+    db.add(
+        PromptItem(
+            story_id=story.id, kind=payload.kind, text=text_value, enabled=True, order=next_order
+        )
+    )
+    await db.commit()
+    story = await db.get(Story, story_id, populate_existing=True)
+    return story_detail(story)
+
+
+@router.put("/{story_id}/prompt-items/{item_id}", response_model=StoryDetailResponse)
+async def update_prompt_item(
+    story_id: int,
+    item_id: int,
+    payload: UpdatePromptItemRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Metni ve/veya aciklik durumunu gunceller (ac-kapa da bu uctan)."""
+    item = await _get_owned_prompt_item(story_id, item_id, user, db)
+    if payload.text is not None:
+        text_value = payload.text.strip()
+        if not text_value:
+            raise HTTPException(status_code=400, detail="Talimat boş olamaz.")
+        item.text = text_value
+    if payload.enabled is not None:
+        item.enabled = payload.enabled
+    await db.commit()
+    story = await db.get(Story, story_id, populate_existing=True)
+    return story_detail(story)
+
+
+@router.delete("/{story_id}/prompt-items/{item_id}", response_model=StoryDetailResponse)
+async def delete_prompt_item(
+    story_id: int,
+    item_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    item = await _get_owned_prompt_item(story_id, item_id, user, db)
+    await db.delete(item)
+    await db.commit()
+    story = await db.get(Story, story_id, populate_existing=True)
+    return story_detail(story)
+
+
+@router.put("/{story_id}/prompt-items", response_model=StoryDetailResponse)
+async def reorder_prompt_items(
+    story_id: int,
+    payload: ReorderPromptItemsRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Maddeleri verilen id sirasina gore yeniden siralar. Listede olmayanlar (yarista eklenmis
+    olabilir) mevcut sirasini koruyarak sona alinir — hicbir madde kaybolmaz."""
+    story = await _get_owned_story(story_id, user, db)
+    by_id = {p.id: p for p in story.prompt_items}
+    ordered = [by_id[i] for i in payload.item_ids if i in by_id]
+    remaining = [p for p in sorted(story.prompt_items, key=lambda p: (p.order, p.id)) if p.id not in set(payload.item_ids)]
+    for position, item in enumerate([*ordered, *remaining]):
+        item.order = position
+    await db.commit()
+    story = await db.get(Story, story_id, populate_existing=True)
     return story_detail(story)
 
 

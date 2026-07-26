@@ -5,8 +5,8 @@ matching prefix (DeepSeek: cached input ~47x cheaper) keep the cache across chap
 cache-breaker (e.g. last-2 chapters, which change every turn) early would throw away the discount.
 
 Order:
-  1. FIXED (never changes across a story's chapters): base identity, genre modules, author
-     style_prompt, negative prompt, task, output format.
+  1. FIXED (never changes across a story's chapters): base identity, genre modules, the author's
+     prompt items (style / negative, enabled ones in the author's order), task, output format.
   2. GROWING (append-only -> prefix stays cached): chapter summaries, chronological.
   3. SLOW variables: entity cards, pinned events.
   4. CACHE-BREAKERS (change every chapter -> last): last 2 chapters full text, RAG window,
@@ -27,7 +27,14 @@ from ..models import Story
 SUMMARY_CHAR_CAP = 300        # max length of a single chapter summary in the prompt
 MAX_SUMMARIES_IN_PROMPT = 60  # older summaries beyond this are dropped
 LAST_CHAPTER_CAP = 12000      # char cap for the last chapter's full text
-PREV_CHAPTER_CAP = 6000       # char cap for the chapter before last
+PREV_CHAPTER_CAP = 6000       # char cap for each earlier chapter in the full-text window
+
+# How many trailing chapters go into the prompt as FULL TEXT (per-story setting, D3.3).
+# Raising it pushes the model toward imitation and multiplies cost; if continuity is weak the
+# fix is better retrieval, not more raw text.
+LAST_CHAPTERS_DEFAULT = 2
+LAST_CHAPTERS_MIN = 1
+LAST_CHAPTERS_MAX = 5
 MAX_ENTITIES_PER_KIND = 60    # cap per character/location/item list; oldest dropped if exceeded
 
 # ---- D2 rollup: the summary block stays a CONSTANT size no matter how long the story gets ----
@@ -151,6 +158,29 @@ def _entity_lines(entities, with_status: bool = False, desc_limit: int = 200) ->
             line += f" (current status: {_head(e.status, STATUS_CHAR_CAP)})"
         lines.append(line)
     return "\n".join(lines) if lines else "(none yet)"
+
+
+def last_chapters_count(story: Story) -> int:
+    """Prompta TAM METIN girecek son bolum sayisi (hikaye bazli ayar, D3.3). Retrieval AYNI
+    degeri kullanir — yoksa ayni bolum hem tam metin hem RAG'den gelir (cift gonderim)."""
+    # `or` KULLANMA: 0 falsy'dir, varsayilana duserdi — 0 gecersiz bir deger, MIN'e kelepcelenmeli.
+    value = getattr(story, "last_chapters_full_text", None)
+    if value is None:
+        value = LAST_CHAPTERS_DEFAULT
+    return max(LAST_CHAPTERS_MIN, min(LAST_CHAPTERS_MAX, int(value)))
+
+
+def prompt_items_block(story: Story, kind: str) -> str | None:
+    """Yazarin madde listesi: yalnizca enabled olanlar, order sirasiyla. Sira yazarindir —
+    kalici kurallar uste, deneysel olanlar alta (bkz. PromptItem docstring'i)."""
+    items = [
+        item
+        for item in sorted(getattr(story, "prompt_items", []) or [], key=lambda i: (i.order, i.id))
+        if item.kind == kind and item.enabled and (item.text or "").strip()
+    ]
+    if not items:
+        return None
+    return "\n".join(f"- {item.text.strip()}" for item in items)
 
 
 def _entity_roster(story: Story) -> str:
@@ -295,12 +325,14 @@ def build_chapter_prompt_sections(
     genre_block = _genre_block(genres or [])
     if genre_block:
         sections.append(("fixed", "[GENRE MODULES]\n" + genre_block))
-    if story.style_prompt and story.style_prompt.strip():
+    style_block = prompt_items_block(story, "style")
+    if style_block:
         sections.append(
-            ("fixed", "[AUTHOR'S PERSISTENT INSTRUCTION - APPLY EVERY CHAPTER]\n" + story.style_prompt.strip())
+            ("fixed", "[AUTHOR'S PERSISTENT INSTRUCTIONS - APPLY EVERY CHAPTER]\n" + style_block)
         )
-    if story.negative_prompt and story.negative_prompt.strip():
-        sections.append(("fixed", "[FORBIDDEN - STRICTLY AVOID]\n" + story.negative_prompt.strip()))
+    negative_block = prompt_items_block(story, "negative")
+    if negative_block:
+        sections.append(("fixed", "[FORBIDDEN - STRICTLY AVOID]\n" + negative_block))
     sections.append(("fixed", TASK_CONTINUATION if is_continuation else TASK_FIRST))
     sections.append(("fixed", JSON_FORMAT_BLOCK))
 
@@ -323,13 +355,14 @@ def build_chapter_prompt_sections(
 
     # ===== 4. CACHE-BREAKERS (change every chapter -> kept last so they don't spoil the prefix) =====
     if is_continuation:
-        last = story.chapters[-1]
-        if len(story.chapters) >= 2:
-            prev = story.chapters[-2]
+        recent = story.chapters[-last_chapters_count(story):]
+        for chapter in recent[:-1]:  # eskiler daha kisa kirpilir, en yeniye yer kalsin
             sections.append((
                 "last_chapters",
-                f"[PREVIOUS CHAPTER (Chapter {prev.index}) - FULL TEXT]\n{_tail(prev.content, PREV_CHAPTER_CAP)}",
+                f"[EARLIER CHAPTER (Chapter {chapter.index}) - FULL TEXT]\n"
+                f"{_tail(chapter.content, PREV_CHAPTER_CAP)}",
             ))
+        last = recent[-1]
         sections.append((
             "last_chapters",
             f"[LAST CHAPTER (Chapter {last.index}) - FULL TEXT]\n{_tail(last.content, LAST_CHAPTER_CAP)}",

@@ -2,6 +2,7 @@ from datetime import date, datetime
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    Boolean,
     Date,
     Float,
     ForeignKey,
@@ -57,9 +58,10 @@ class Story(Base):
     title: Mapped[str] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(16), default="PENDING")
     initial_prompt: Mapped[str] = mapped_column(Text)
-    # Yazarin kalici talimatlari: her bolum uretiminde sisteme enjekte edilir
-    style_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
-    negative_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Prompta TAM METIN girecek son bolum sayisi (D3.3). Buyutmek tutarliligi bir miktar
+    # artirir ama modeli taklide iter, yaraticiligi dusurur ve token maliyetini katlar;
+    # sureklilik zayifsa cozum daha cok ham bolum degil daha iyi retrieval.
+    last_chapters_full_text: Mapped[int] = mapped_column(Integer, nullable=False, server_default="2")
     # Yazar bolum duzenledikten sonra bir SONRAKI uretime tasinacak notlar (JSON listesi)
     pending_edit_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
@@ -85,6 +87,33 @@ class Story(Base):
     arcs: Mapped[list["Arc"]] = relationship(
         cascade="all, delete-orphan", order_by="Arc.start_index", lazy="selectin"
     )
+    prompt_items: Mapped[list["PromptItem"]] = relationship(
+        cascade="all, delete-orphan", order_by="PromptItem.order, PromptItem.id", lazy="selectin"
+    )
+
+
+class PromptItem(Base):
+    """Yazarin kalici talimatlari — tek blob yerine SIRALI MADDE listesi (D3.3).
+
+    Faydasi: her maddeyi tek tek acip kapatabilmek, izole edebilmek, sirasini degistirebilmek.
+    kind: "style" (uygulanacak) | "negative" (kacinilacak).
+
+    NOT — cache icin ID-slot mantigi ISE YARAMAZ: prefix cache METIN sirasini eslestirir,
+    ID'leri degil; ortadan yapilan her duzenleme o noktadan sonrasini zaten gecersiz kilar.
+    Tek gercek optimizasyon kalici kurallari uste, deneysel olanlari alta koymak (sirayi
+    yazar belirler). Yazar bunlari ayda bir duzenler, bolum basina degil — cache kirilmasi
+    onemsiz."""
+
+    __tablename__ = "prompt_items"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    story_id: Mapped[int] = mapped_column(ForeignKey("stories.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(16))  # style | negative
+    text: Mapped[str] = mapped_column(Text)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
+    # "order" SQL'de ayrilmis kelime; kolon adi order_index
+    order: Mapped[int] = mapped_column("order_index", Integer, nullable=False, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
 class Arc(Base):

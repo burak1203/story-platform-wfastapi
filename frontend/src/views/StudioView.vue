@@ -3,7 +3,7 @@ import { ref, computed, onMounted, nextTick, watch, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { useStoryStore } from '@/stores/storyStore'
 import { useLlmKeyStore } from '@/stores/llmKeyStore'
-import type { ElementDto, ElementKind } from '@/types'
+import type { ElementDto, ElementKind, PromptItemDto, PromptItemKind } from '@/types'
 
 const store = useStoryStore()
 const llmKeyStore = useLlmKeyStore()
@@ -21,11 +21,28 @@ const chapterDraft = ref('')
 const editingSummaryIndex = ref<number | null>(null)
 const summaryDraft = ref('')
 
-// --- Yazım ayarları (style / negative prompt) ---
+// --- Yazım ayarları: talimat MADDELERİ + son N bölüm ---
 const showSettings = ref(false)
-const styleDraft = ref('')
-const negativeDraft = ref('')
+const newItemText = ref<Record<PromptItemKind, string>>({ style: '', negative: '' })
+const editingItemId = ref<number | null>(null)
+const itemDraft = ref('')
+const lastChaptersDraft = ref(2)
 const settingsSaved = ref(false)
+
+const promptSections = computed(() => [
+  {
+    kind: 'style' as PromptItemKind,
+    title: 'Talimatlar (her bölümde uygulanır)',
+    placeholder: 'Örn: Karanlık ve şiirsel bir ton kullan',
+    items: (store.story?.promptItems || []).filter((i) => i.kind === 'style'),
+  },
+  {
+    kind: 'negative' as PromptItemKind,
+    title: 'Negatif talimatlar (bunlardan kaçınılır)',
+    placeholder: 'Örn: Modern teknolojiden bahsetme',
+    items: (store.story?.promptItems || []).filter((i) => i.kind === 'negative'),
+  },
+])
 
 // --- Varlık (karakter/mekan/eşya) düzenleme ---
 const editingElement = ref<{ kind: ElementKind; id: number } | null>(null)
@@ -47,8 +64,7 @@ onUnmounted(() => {
 watch(
   () => store.story?.id,
   () => {
-    styleDraft.value = store.story?.stylePrompt || ''
-    negativeDraft.value = store.story?.negativePrompt || ''
+    lastChaptersDraft.value = store.story?.lastChaptersFullText ?? 2
   },
 )
 
@@ -100,9 +116,57 @@ const saveSummaryEdit = async () => {
   editingSummaryIndex.value = null
 }
 
-// --- Ayarlar ---
-const saveSettings = async () => {
-  await store.updateSettings(storyId.value, styleDraft.value, negativeDraft.value)
+// --- Ayarlar: talimat maddeleri ---
+const addPromptItem = async (kind: PromptItemKind) => {
+  const text = newItemText.value[kind].trim()
+  if (!text) return
+  await store.addPromptItem(storyId.value, kind, text)
+  newItemText.value[kind] = ''
+}
+
+const startItemEdit = (item: PromptItemDto) => {
+  editingItemId.value = item.id
+  itemDraft.value = item.text
+}
+
+const saveItemEdit = async () => {
+  if (editingItemId.value === null || !itemDraft.value.trim()) return
+  await store.updatePromptItem(storyId.value, editingItemId.value, { text: itemDraft.value })
+  editingItemId.value = null
+}
+
+const toggleItem = async (item: PromptItemDto) => {
+  await store.updatePromptItem(storyId.value, item.id, { enabled: !item.enabled })
+}
+
+const removeItem = async (item: PromptItemDto) => {
+  if (confirm('Bu talimatı silmek istediğine emin misin?')) {
+    await store.deletePromptItem(storyId.value, item.id)
+  }
+}
+
+/** Bir maddeyi kendi türü içinde yukarı/aşağı taşır. Sıra, promptta birleşme sırasıdır:
+ *  kalıcı kurallar üstte, deneysel olanlar altta. */
+const moveItem = async (kind: PromptItemKind, index: number, delta: number) => {
+  const section = promptSections.value.find((s) => s.kind === kind)
+  if (!section) return
+  const target = index + delta
+  if (target < 0 || target >= section.items.length) return
+  const reordered = [...section.items]
+  const [moved] = reordered.splice(index, 1)
+  if (!moved) return
+  reordered.splice(target, 0, moved)
+  // Backend TÜM maddelerin sırasını bekler: diğer türü mevcut sırasıyla koru
+  const others = (store.story?.promptItems || []).filter((i) => i.kind !== kind)
+  const ids =
+    kind === 'style'
+      ? [...reordered.map((i) => i.id), ...others.map((i) => i.id)]
+      : [...others.map((i) => i.id), ...reordered.map((i) => i.id)]
+  await store.reorderPromptItems(storyId.value, ids)
+}
+
+const saveLastChapters = async () => {
+  await store.updateSettings(storyId.value, lastChaptersDraft.value)
   settingsSaved.value = true
   setTimeout(() => (settingsSaved.value = false), 2000)
 }
@@ -180,27 +244,108 @@ const elementSections = computed(() => [
         >
           ⚙️ Yazım Ayarları {{ showSettings ? '▾' : '▸' }}
         </button>
-        <div v-if="showSettings" class="p-3 pt-0 flex flex-col gap-2">
-          <label class="text-xs text-slate-500">Talimat (her bölümde uygulanır)</label>
-          <textarea
-            v-model="styleDraft"
-            rows="3"
-            placeholder="Örn: Karanlık ve şiirsel bir ton kullan, diyaloglara ağırlık ver..."
-            class="bg-slate-900 border border-slate-700 rounded p-2 text-xs focus:outline-none focus:border-amber-500 resize-none"
-          ></textarea>
-          <label class="text-xs text-slate-500">Negatif talimat (bunlardan kaçınılır)</label>
-          <textarea
-            v-model="negativeDraft"
-            rows="3"
-            placeholder="Örn: Modern teknolojiden bahsetme, karakterleri öldürme..."
-            class="bg-slate-900 border border-slate-700 rounded p-2 text-xs focus:outline-none focus:border-amber-500 resize-none"
-          ></textarea>
-          <button
-            @click="saveSettings"
-            class="self-end bg-amber-600 hover:bg-amber-500 text-slate-900 text-xs font-bold px-4 py-1.5 rounded transition-colors"
-          >
-            {{ settingsSaved ? '✓ Kaydedildi' : 'Kaydet' }}
-          </button>
+        <div v-if="showSettings" class="p-3 pt-0 flex flex-col gap-4">
+          <!-- Talimat maddeleri: tek tek açılıp kapanır, sıralanır -->
+          <div v-for="section in promptSections" :key="section.kind" class="flex flex-col gap-2">
+            <label class="text-xs text-slate-500">{{ section.title }}</label>
+            <p v-if="!section.items.length" class="text-xs text-slate-600 italic">Henüz talimat yok.</p>
+
+            <div
+              v-for="(item, index) in section.items"
+              :key="item.id"
+              class="bg-slate-900/60 border border-slate-700 rounded p-2 flex flex-col gap-1"
+            >
+              <template v-if="editingItemId !== item.id">
+                <div class="flex items-start gap-2">
+                  <input
+                    type="checkbox"
+                    :checked="item.enabled"
+                    @change="toggleItem(item)"
+                    class="mt-0.5 accent-amber-500 shrink-0"
+                    :title="item.enabled ? 'Açık — prompta gider' : 'Kapalı — prompta girmez'"
+                  />
+                  <span
+                    class="text-xs leading-relaxed flex-1 whitespace-pre-wrap"
+                    :class="item.enabled ? 'text-slate-300' : 'text-slate-600 line-through'"
+                  >{{ item.text }}</span>
+                </div>
+                <div class="flex gap-2 justify-end text-xs text-slate-500">
+                  <button
+                    @click="moveItem(section.kind, index, -1)"
+                    :disabled="index === 0"
+                    class="hover:text-amber-500 disabled:opacity-30 disabled:hover:text-slate-500"
+                    title="Yukarı taşı"
+                  >↑</button>
+                  <button
+                    @click="moveItem(section.kind, index, 1)"
+                    :disabled="index === section.items.length - 1"
+                    class="hover:text-amber-500 disabled:opacity-30 disabled:hover:text-slate-500"
+                    title="Aşağı taşı"
+                  >↓</button>
+                  <button @click="startItemEdit(item)" class="hover:text-amber-500">✎</button>
+                  <button @click="removeItem(item)" class="hover:text-red-500">✕</button>
+                </div>
+              </template>
+
+              <div v-else class="flex flex-col gap-2">
+                <textarea
+                  v-model="itemDraft"
+                  rows="3"
+                  class="bg-slate-900 border border-slate-600 rounded p-2 text-xs focus:outline-none focus:border-amber-500 resize-none"
+                ></textarea>
+                <div class="flex gap-2 justify-end">
+                  <button @click="editingItemId = null" class="text-xs text-slate-400 hover:text-slate-200">İptal</button>
+                  <button @click="saveItemEdit" class="text-xs bg-amber-600 hover:bg-amber-500 text-slate-900 font-bold px-3 py-1 rounded">Kaydet</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="flex gap-2">
+              <input
+                v-model="newItemText[section.kind]"
+                type="text"
+                :placeholder="section.placeholder"
+                @keyup.enter="addPromptItem(section.kind)"
+                class="flex-1 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs focus:outline-none focus:border-amber-500"
+              />
+              <button
+                @click="addPromptItem(section.kind)"
+                :disabled="!newItemText[section.kind].trim()"
+                class="text-xs bg-slate-700 hover:bg-slate-600 text-amber-500 px-3 py-1 rounded disabled:opacity-40"
+              >
+                + Ekle
+              </button>
+            </div>
+          </div>
+
+          <p class="text-xs text-slate-600 leading-relaxed border-t border-slate-700 pt-2">
+            Sıra promptta birleşme sırasıdır: kalıcı kuralları üste, denemelik olanları alta koy.
+          </p>
+
+          <!-- Son N bölüm ayarı -->
+          <div class="flex flex-col gap-1 border-t border-slate-700 pt-3">
+            <label class="text-xs text-slate-500">Prompta tam metin girecek son bölüm sayısı</label>
+            <div class="flex items-center gap-2">
+              <input
+                v-model.number="lastChaptersDraft"
+                type="number"
+                min="1"
+                max="5"
+                class="w-16 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs focus:outline-none focus:border-amber-500"
+              />
+              <button
+                @click="saveLastChapters"
+                class="bg-amber-600 hover:bg-amber-500 text-slate-900 text-xs font-bold px-4 py-1.5 rounded transition-colors"
+              >
+                {{ settingsSaved ? '✓ Kaydedildi' : 'Kaydet' }}
+              </button>
+            </div>
+            <p class="text-xs text-slate-600 leading-relaxed">
+              Daha fazlası tutarlılığı artırır ama yaratıcılığı düşürür ve token maliyetini
+              yükseltir. Süreklilik zayıfsa çözüm genelde daha çok ham bölüm değil, daha iyi
+              hafıza aramasıdır. (1-5, varsayılan 2)
+            </p>
+          </div>
         </div>
       </div>
 

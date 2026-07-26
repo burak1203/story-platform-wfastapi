@@ -5,6 +5,7 @@ import type {
   StorySummaryResponse,
   CreateStoryRequest,
   ElementKind,
+  PromptItemKind,
 } from '../types'
 import { useLlmKeyStore } from './llmKeyStore'
 
@@ -238,16 +239,65 @@ export const useStoryStore = defineStore('story', {
       }
     },
 
-    async updateSettings(storyId: number, stylePrompt: string, negativePrompt: string) {
+    async updateSettings(storyId: number, lastChaptersFullText: number) {
       this.error = null
       try {
         const response = await axios.put(`${API_URL}/${storyId}/settings`, {
-          stylePrompt,
-          negativePrompt,
+          lastChaptersFullText,
         })
         this.story = response.data
       } catch (err: any) {
         this.error = err.response?.data?.detail || err.message || 'Ayarlar kaydedilemedi.'
+        throw err
+      }
+    },
+
+    // --- Yazarin talimat maddeleri: her uc guncel hikayeyi doner, store dogrudan tazelenir ---
+
+    async addPromptItem(storyId: number, kind: PromptItemKind, text: string) {
+      this.error = null
+      try {
+        const response = await axios.post(`${API_URL}/${storyId}/prompt-items`, { kind, text })
+        this.story = response.data
+      } catch (err: any) {
+        this.error = err.response?.data?.detail || err.message || 'Talimat eklenemedi.'
+        throw err
+      }
+    },
+
+    async updatePromptItem(
+      storyId: number,
+      itemId: number,
+      payload: { text?: string; enabled?: boolean },
+    ) {
+      this.error = null
+      try {
+        const response = await axios.put(`${API_URL}/${storyId}/prompt-items/${itemId}`, payload)
+        this.story = response.data
+      } catch (err: any) {
+        this.error = err.response?.data?.detail || err.message || 'Talimat güncellenemedi.'
+        throw err
+      }
+    },
+
+    async deletePromptItem(storyId: number, itemId: number) {
+      this.error = null
+      try {
+        const response = await axios.delete(`${API_URL}/${storyId}/prompt-items/${itemId}`)
+        this.story = response.data
+      } catch (err: any) {
+        this.error = err.response?.data?.detail || err.message || 'Talimat silinemedi.'
+        throw err
+      }
+    },
+
+    async reorderPromptItems(storyId: number, itemIds: number[]) {
+      this.error = null
+      try {
+        const response = await axios.put(`${API_URL}/${storyId}/prompt-items`, { itemIds })
+        this.story = response.data
+      } catch (err: any) {
+        this.error = err.response?.data?.detail || err.message || 'Sıra kaydedilemedi.'
         throw err
       }
     },
