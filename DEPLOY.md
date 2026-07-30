@@ -176,21 +176,30 @@ onun yerine geçmez, ondan önceki elle güvenceyi sağlar.
 mkdir -p ~/backups
 STAMP=$(date +%Y%m%d-%H%M%S)
 docker compose -f docker-compose.prod.yml exec -T postgres \
-  pg_dump -U kurgu_admin kurgu_db | gzip > ~/backups/kurgu_db-$STAMP.sql.gz
+  pg_dump -U kurgu_admin --clean --if-exists kurgu_db | gzip > ~/backups/kurgu_db-$STAMP.sql.gz
 ls -lh ~/backups/
+```
 
-# --- Kendi makinende: dump'ı indir ---
-scp azureuser@A.B.C.D:~/backups/kurgu_db-$STAMP.sql.gz .
+`$STAMP` yalnızca VM'deki oturumda tanımlı — kendi makinende boş genişler,
+bu yüzden indirirken dosya adını `ls` çıktısından elle kopyala:
+
+```bash
+# --- Kendi makinende: dump'ı indir (dosya adını yukarıdaki ls çıktısından yapıştır) ---
+scp azureuser@A.B.C.D:~/backups/kurgu_db-20260730-120000.sql.gz .
 ```
 
 **Geri yükleme (bunu ASLA test etmeden bırakma — hiç geri yüklenmemiş bir yedek,
 alınmamış bir yedek kadar tehlikelidir):**
 
 ```bash
-# VM üzerinde, mevcut veriyi silip dump'ı geri yükler — dikkatli calistir
-gunzip -c ~/backups/kurgu_db-$STAMP.sql.gz | \
+# VM üzerinde, mevcut veriyi silip dump'ı geri yükler; --clean --if-exists dump'a
+# DROP ifadeleri gomdugu ve ON_ERROR_STOP=1 ilk hatada durdurdugu icin -- bunlar
+# olmadan psql var olan tablolara carpar, "already exists" hatalariyla YARIM doner
+# ve yine de basarili gibi cikis kodu verebilir (test ettigini sanirsin, aslinda
+# yarim kalmis olur) -- burada gercekten mevcut veriyi silip TAM geri yukler
+gunzip -c ~/backups/kurgu_db-20260730-120000.sql.gz | \
   docker compose -f docker-compose.prod.yml exec -T postgres \
-  psql -U kurgu_admin -d kurgu_db
+  psql -v ON_ERROR_STOP=1 -U kurgu_admin -d kurgu_db
 ```
 
 ## 6. Google OAuth (istenildiği zaman, deploy'dan bağımsız)
