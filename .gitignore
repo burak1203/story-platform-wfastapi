@@ -22,9 +22,4 @@ ai-worker/__pycache__/
 # ...ama ornek sablon (sir icermez) izlenmeye devam eder
 !.env.prod.example
 
-frontend/node_modules/*
-
-_
-
-CLAUDE.md
-DEPLOY.md
+frontend/node_modules/
