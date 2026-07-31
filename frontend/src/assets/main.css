@@ -1,3 +1,28 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+@layer base {
+  /* Klavyeyle gezen odagi GORMELI. Tarayici varsayilan halkasi bazi tarayicilarda koyu
+     zeminde neredeyse gorunmez; belirgin ve her iki temada okunur bir halka koyuyoruz.
+     :focus-visible (:focus degil) — fareyle tiklayana halka cikmasin. */
+  :focus-visible {
+    outline: 2px solid theme('colors.indigo.500');
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
+
+  /* Hareket hassasiyeti olan kullanicilar icin animasyonlari sondur. Sifir degil, 0.01ms:
+     tamamen 0 yapmak bazi tarayicilarda transitionend olayini hic tetiklemez ve ona
+     bagli JS mantigi asili kalir. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
