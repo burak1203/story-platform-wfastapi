@@ -28,6 +28,9 @@ export const useStoryStore = defineStore('story', {
   state: () => ({
     story: null as StoryDetailResponse | null,
     myStories: [] as StorySummaryResponse[], // dashboard için hafif özet listesi
+    // Liste bir kez cekildi mi? Sidebar her rota degisiminde monte olup duruyor; bu
+    // bayrak olmadan her gecis bir /my-stories istegi daha atardi.
+    myStoriesLoaded: false,
     isLoading: false,
     error: null as string | null,
     eventSource: null as EventSource | null,
@@ -35,18 +38,30 @@ export const useStoryStore = defineStore('story', {
   }),
 
   actions: {
-    // dashboard'da gösterilecek tüm hikayeleri getirir
+    // dashboard'da gösterilecek tüm hikayeleri getirir (HER ZAMAN tazeler)
     async fetchMyStories() {
       this.isLoading = true
       this.error = null
       try {
         const response = await axios.get<StorySummaryResponse[]>(`${API_URL}/my-stories`)
         this.myStories = response.data
+        this.myStoriesLoaded = true
       } catch (err: any) {
         this.error = err.message || 'Hikayeler yüklenemedi.'
       } finally {
         this.isLoading = false
       }
+    },
+
+    /**
+     * Liste elde YOKSA ceker, VARSA dokunmaz. Sidebar bunu kullanir: kabuk her rota
+     * degisiminde yeniden monte oldugu icin fetchMyStories cagirsaydi her gecis bir
+     * istek olurdu. Liste degistiginde (olusturma/silme) asagidaki aksiyonlar zaten
+     * store'u guncelliyor, yani bayat kalmaz.
+     */
+    async ensureMyStories() {
+      if (this.myStoriesLoaded) return
+      await this.fetchMyStories()
     },
 
     // Sıfırdan hikaye oluşturur ve yönlendirme için döner
@@ -62,6 +77,10 @@ export const useStoryStore = defineStore('story', {
       this.error = null
       try {
         const response = await axios.post<StoryDetailResponse>(API_URL, payload)
+        // Liste artik bayat: yeni hikaye icinde yok. Burada hemen CEKMIYORUZ (bu aksiyonun
+        // isLoading'iyle carpisir); bayrak dusunce bir sonraki gezinmede ensure tazeler —
+        // olusturmadan sonra zaten /studio/:id'ye gidiliyor.
+        this.myStoriesLoaded = false
         return response.data
       } catch (err: any) {
         this.error = redirectToKeyModal(err)
@@ -228,10 +247,9 @@ export const useStoryStore = defineStore('story', {
     async editChapterSummary(storyId: number, chapterIndex: number, newSummary: string) {
       this.error = null
       try {
-        const response = await axios.put(
-          `${API_URL}/${storyId}/chapters/${chapterIndex}/summary`,
-          { newSummary },
-        )
+        const response = await axios.put(`${API_URL}/${storyId}/chapters/${chapterIndex}/summary`, {
+          newSummary,
+        })
         this.story = response.data
       } catch (err: any) {
         this.error = err.response?.data?.detail || err.message || 'Özet güncellenemedi.'
@@ -259,7 +277,8 @@ export const useStoryStore = defineStore('story', {
         const response = await axios.put(`${API_URL}/${storyId}/publishing`, payload)
         this.story = response.data
       } catch (err: any) {
-        this.error = err.response?.data?.detail || err.message || 'Yayımlama ayarları kaydedilemedi.'
+        this.error =
+          err.response?.data?.detail || err.message || 'Yayımlama ayarları kaydedilemedi.'
         throw err
       }
     },
