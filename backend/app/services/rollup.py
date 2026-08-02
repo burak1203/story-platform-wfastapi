@@ -26,6 +26,7 @@ from ..ai.prompts import (
     ROLLUP_ARC_SIZE,
     plan_rollup,
 )
+from ..config import settings
 from ..models import Arc, Chapter, Story
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,11 @@ async def _summaries_for_range(db: AsyncSession, story_id: int, start: int, end:
 
 
 async def _compress(ctx: LlmCtx, system_prompt: str, payload: str) -> str | None:
+    """KRITIK: BYOK'ta yanit tumuyle kullanicinin sunucusunun kontrolunde (bkz. generation.py
+    ayni not). Tavani asan cikti KIRPILMAZ, basarisiz sayilir (None) — sismis bir ark ozeti
+    yalnizca depoyu degil, HER SONRAKI uretimin baglam butcesini de bozar. Cagiran (ensure_rollup)
+    None'i zaten 'bu ark hazir degil, bir sonraki kosuda tekrar denenir' olarak ele aliyor;
+    o ana kadar prompt bu aralik icin ham bolum ozetlerine duser (kayip yok)."""
     text = await ai.chat_text(
         ctx,
         ctx.util_model,
@@ -87,7 +93,11 @@ async def _compress(ctx: LlmCtx, system_prompt: str, payload: str) -> str | None
         max_tokens=700,
         reasoning=False,  # util isi: reasoning gereksiz + output olarak faturalanir
     )
-    return text.strip() or None
+    summary = text.strip() or None
+    if summary and len(summary) > settings.max_arc_summary_chars:
+        logger.warning("_compress: tavan asildi (%s karakter), basarisiz sayildi", len(summary))
+        return None
+    return summary
 
 
 async def ensure_rollup(db: AsyncSession, story: Story, ctx: LlmCtx) -> int:

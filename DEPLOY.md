@@ -105,6 +105,7 @@ nano .env.prod
 | `EMBEDDING_PROVIDER` | `openai` (Gemini'den geçildi; sağlayıcı değişimi = tam re-embed) |
 | `CORS_ORIGINS` | `https://A-B-C-D.sslip.io` |
 | `GOOGLE_OAUTH_CLIENT_ID` | opsiyonel; boşsa Google girişi kapalı (aşağıya bak) |
+| `MAX_REQUEST_BODY_SIZE` | Caddy'nin `/api/*` gövde tavanı (varsayılan 1MB); FastAPI'ye ulaşmadan kesilir |
 
 **Üretim LLM anahtarı YOKTUR** — bölüm yazımı BYOK'tur, kullanıcının anahtarı her istekte
 header ile gelir ve sunucuda saklanmaz. `.env.prod`'a üretim anahtarı ekleme.

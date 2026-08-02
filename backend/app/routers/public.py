@@ -40,6 +40,7 @@ from ..models import (
     Story,
     User,
 )
+from ..params import IdPath
 from ..ratelimit import (
     COMMENT_WRITE_LIMIT,
     PUBLIC_READ_LIMIT,
@@ -181,7 +182,7 @@ async def _readable_story(story_id: int, db: AsyncSession):
 @router.get("/stories/{story_id}", response_model=PublicStoryDetail)
 @limiter.limit(PUBLIC_READ_LIMIT)
 async def get_public_story(
-    request: Request, story_id: int, db: AsyncSession = Depends(get_db)
+    request: Request, story_id: IdPath, db: AsyncSession = Depends(get_db)
 ):
     """Hikaye sayfasi: bolum listesi (METIN YOK) + sayaclar. unlisted id ile okunur."""
     story = await _readable_story(story_id, db)
@@ -240,8 +241,8 @@ async def get_public_story(
 @limiter.limit(PUBLIC_READ_LIMIT)
 async def get_public_chapter(
     request: Request,
-    story_id: int,
-    index: int,
+    story_id: IdPath,
+    index: IdPath,
     db: AsyncSession = Depends(get_db),
     viewer: User | None = Depends(get_optional_user),
 ):
@@ -375,8 +376,8 @@ async def _like_state(chapter_id: int, user_id: int, db: AsyncSession) -> Chapte
 @limiter.limit(VOTE_LIMIT)
 async def like_chapter(
     request: Request,
-    story_id: int,
-    index: int,
+    story_id: IdPath,
+    index: IdPath,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -398,8 +399,8 @@ async def like_chapter(
 @limiter.limit(VOTE_LIMIT)
 async def unlike_chapter(
     request: Request,
-    story_id: int,
-    index: int,
+    story_id: IdPath,
+    index: IdPath,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -420,8 +421,8 @@ async def unlike_chapter(
 @limiter.limit(PUBLIC_READ_LIMIT)
 async def list_comments(
     request: Request,
-    story_id: int,
-    index: int,
+    story_id: IdPath,
+    index: IdPath,
     limit: int = Query(default=20, ge=1, le=PAGE_SIZE_MAX),
     offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
@@ -480,8 +481,8 @@ def _to_comment(row, author_id: int) -> PublicCommentDto:
 @limiter.limit(COMMENT_WRITE_LIMIT)
 async def create_comment(
     request: Request,
-    story_id: int,
-    index: int,
+    story_id: IdPath,
+    index: IdPath,
     payload: CreateCommentRequest,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -523,9 +524,9 @@ async def _owned_comment(story_id: int, index: int, comment_id: int, db: AsyncSe
 @limiter.limit(PUBLIC_READ_LIMIT)
 async def delete_comment(
     request: Request,
-    story_id: int,
-    index: int,
-    comment_id: int,
+    story_id: IdPath,
+    index: IdPath,
+    comment_id: IdPath,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -548,9 +549,9 @@ async def delete_comment(
 @limiter.limit(PUBLIC_READ_LIMIT)
 async def pin_comment(
     request: Request,
-    story_id: int,
-    index: int,
-    comment_id: int,
+    story_id: IdPath,
+    index: IdPath,
+    comment_id: IdPath,
     payload: PinCommentRequest,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),

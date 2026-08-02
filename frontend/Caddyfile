@@ -3,6 +3,14 @@
 #   Lokal: :80                (sertifikasiz duz HTTP)
 {$SITE_ADDRESS} {
 	handle /api/* {
+		# FastAPI/Pydantic sinirlarina ulasmadan ONCE kesilsin diye burada: aksi halde
+		# buyuk bir govde uygulama katmanina kadar tasinir (bellek/CPU o noktaya kadar
+		# zaten harcanmis olur). En buyuk mesru govde bir bolum duzenlemesi (~60.000
+		# karakter + JSON/camelCase payı); MAX_REQUEST_BODY_SIZE .env.prod'dan gelir,
+		# yoksa 1MB varsayilir.
+		request_body {
+			max_size {$MAX_REQUEST_BODY_SIZE:1MB}
+		}
 		reverse_proxy backend:8000 {
 			flush_interval -1
 		}

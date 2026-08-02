@@ -5,11 +5,12 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..ai import embeddings
 from ..ai.client import LlmCtx
+from ..config import settings
 from ..database import get_db
 from ..models import (
     READABLE_WITHOUT_OWNER,
@@ -19,6 +20,7 @@ from ..models import (
     User,
 )
 from ..ai.prompts import parse_edit_notes
+from ..params import IdPath
 from ..schemas import (
     MAX_PROMPT_ITEM_LEN,
     MAX_PROMPT_ITEMS,
@@ -101,6 +103,18 @@ async def create_story(
     if not title or not prompt:
         raise HTTPException(status_code=400, detail="Başlık ve başlangıç konusu boş olamaz.")
 
+    story_count = (
+        await db.execute(select(func.count(Story.id)).where(Story.user_id == user.id))
+    ).scalar_one()
+    if story_count >= settings.max_stories_per_user:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"En fazla {settings.max_stories_per_user} hikaye oluşturabilirsin "
+                f"(şu an {story_count}). Yeni bir tane açmadan önce birini silmen gerekiyor."
+            ),
+        )
+
     story = Story(user_id=user.id, title=title, status="PENDING", initial_prompt=prompt)
     db.add(story)
     await db.flush()  # maddelerin FK'si icin story.id gerekiyor
@@ -126,7 +140,7 @@ async def create_story(
 
 @router.get("/{story_id}", response_model=StoryDetailResponse)
 async def get_story(
-    story_id: int, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+    story_id: IdPath, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
 ):
     story = await _get_owned_story(story_id, user, db)
     return story_detail(story)
@@ -136,7 +150,7 @@ async def get_story(
 @limiter.limit(GENERATION_LIMIT)
 async def continue_story(
     request: Request,
-    story_id: int,
+    story_id: IdPath,
     payload: ContinueStoryRequest,
     user: User = Depends(get_current_user),
     ctx: LlmCtx = Depends(get_llm_ctx),
@@ -147,6 +161,24 @@ async def continue_story(
         raise HTTPException(status_code=400, detail="Hamle boş olamaz.")
 
     story = await _get_owned_story(story_id, user, db)
+
+    if len(story.chapters) >= settings.max_chapters_per_story:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Bu hikaye azami bölüm sayısına ({settings.max_chapters_per_story}) ulaştı, "
+                "yeni bölüm üretilemez."
+            ),
+        )
+    total_chars = sum(len(c.content) for c in story.chapters)
+    if total_chars >= settings.max_story_total_chars:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Bu hikaye azami depolama sınırına ({settings.max_story_total_chars:,} karakter) "
+                f"ulaştı (şu an {total_chars:,}), yeni bölüm üretilemez."
+            ),
+        )
 
     # Hic bolum yoksa (ilk uretim FAILED olduysa) bastan ilk bolum uretilir
     new_status = "PENDING" if len(story.chapters) == 0 else "GENERATING"
@@ -170,7 +202,7 @@ async def continue_story(
 
 @router.delete("/{story_id}")
 async def delete_story(
-    story_id: int, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+    story_id: IdPath, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
 ):
     story = await _get_owned_story(story_id, user, db)
     await db.delete(story)
@@ -180,7 +212,7 @@ async def delete_story(
 
 @router.put("/{story_id}/settings", response_model=StoryDetailResponse)
 async def update_story_settings(
-    story_id: int,
+    story_id: IdPath,
     request: UpdateStorySettingsRequest,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -210,7 +242,7 @@ def _normalize_tags(raw: list[str] | None) -> list[str]:
 
 @router.put("/{story_id}/publishing", response_model=StoryDetailResponse)
 async def update_publishing(
-    story_id: int,
+    story_id: IdPath,
     payload: UpdatePublishingRequest,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -267,7 +299,7 @@ async def _get_owned_prompt_item(story_id: int, item_id: int, user: User, db: As
 
 @router.post("/{story_id}/prompt-items", response_model=StoryDetailResponse)
 async def create_prompt_item(
-    story_id: int,
+    story_id: IdPath,
     payload: CreatePromptItemRequest,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -293,8 +325,8 @@ async def create_prompt_item(
 
 @router.put("/{story_id}/prompt-items/{item_id}", response_model=StoryDetailResponse)
 async def update_prompt_item(
-    story_id: int,
-    item_id: int,
+    story_id: IdPath,
+    item_id: IdPath,
     payload: UpdatePromptItemRequest,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -315,8 +347,8 @@ async def update_prompt_item(
 
 @router.delete("/{story_id}/prompt-items/{item_id}", response_model=StoryDetailResponse)
 async def delete_prompt_item(
-    story_id: int,
-    item_id: int,
+    story_id: IdPath,
+    item_id: IdPath,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -329,7 +361,7 @@ async def delete_prompt_item(
 
 @router.put("/{story_id}/prompt-items", response_model=StoryDetailResponse)
 async def reorder_prompt_items(
-    story_id: int,
+    story_id: IdPath,
     payload: ReorderPromptItemsRequest,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -351,8 +383,8 @@ async def reorder_prompt_items(
 @limiter.limit(GENERATION_LIMIT)
 async def edit_chapter(
     request: Request,
-    story_id: int,
-    chapter_index: int,
+    story_id: IdPath,
+    chapter_index: IdPath,
     payload: EditChapterRequest,
     user: User = Depends(get_current_user),
     ctx: LlmCtx = Depends(get_llm_ctx),
@@ -419,8 +451,8 @@ async def edit_chapter(
 
 @router.put("/{story_id}/chapters/{chapter_index}/summary", response_model=StoryDetailResponse)
 async def edit_chapter_summary(
-    story_id: int,
-    chapter_index: int,
+    story_id: IdPath,
+    chapter_index: IdPath,
     request: EditChapterSummaryRequest,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -484,7 +516,7 @@ def _keyword_search(story: Story, query: str) -> list[SearchHit]:
 @limiter.limit(SEARCH_LIMIT)
 async def search_story(
     request: Request,
-    story_id: int,
+    story_id: IdPath,
     query: str,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -557,7 +589,7 @@ async def search_story(
 
 @router.get("/{story_id}/stream")
 async def stream_story(
-    story_id: int, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+    story_id: IdPath, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
 ):
     await _get_owned_story(story_id, user, db)
     queue = broker.subscribe(story_id)

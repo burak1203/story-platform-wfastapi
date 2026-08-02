@@ -45,11 +45,46 @@ def _run_upgrade() -> None:
     command.upgrade(cfg, "head")
 
 
+# DB denetim raporu bulgusu: EMBEDDING_DIM .env'den okunur ama migration'larda vektor
+# boyutu 768 SABIT yazili (bkz. models.py Vector(settings.embedding_dim) vs. migration'daki
+# pgvector.sqlalchemy.vector.VECTOR(dim=768)). Biri degisip digeri migrationsuz kalirsa
+# ORM'in bekledigi boyutla DB kolonunun gercek boyutu SESSIZCE ayrisir — bozuk embedding'den
+# daha kotu, cunku hata hemen degil aylar sonra "queryyle hicbir sey eslesmiyor" olarak
+# ortaya cikar. Acilista karsilastir, uyusmazsa ACILMA.
+_VECTOR_TABLES = ("events", "chunks", "characters", "locations", "items")
+
+
+async def _check_embedding_dim(conn) -> None:
+    rows = (
+        await conn.execute(
+            text(
+                """
+                SELECT c.relname, a.atttypmod
+                FROM pg_attribute a JOIN pg_class c ON a.attrelid = c.oid
+                WHERE c.relname = ANY(:tables) AND a.attname = 'embedding' AND a.attnum > 0
+                """
+            ),
+            {"tables": list(_VECTOR_TABLES)},
+        )
+    ).all()
+    mismatched = [(table, dim) for table, dim in rows if dim != settings.embedding_dim]
+    if mismatched:
+        details = ", ".join(f"{table}={dim}" for table, dim in mismatched)
+        raise RuntimeError(
+            f"EMBEDDING_DIM ({settings.embedding_dim}) DB'deki gercek vektor boyutuyla "
+            f"uyusmuyor: {details}. Byle baslatmak sessizce bozuk/yanlis-uzayli embedding "
+            "uretir. EMBEDDING_DIM'i DB'deki gercek boyuta geri al, ya da boyutu kasitli "
+            "degistirdiysen TUM vektor kolonlarini yeni boyuta tasiyan bir migration yaz "
+            "ve mevcut kayitlari yeniden embed'le."
+        )
+
+
 async def init_db() -> None:
     # Semayi guncel migration'a getir (auto-create YOK)
     await asyncio.to_thread(_run_upgrade)
-    # Runtime toparlama: acilistaki takili uretim durumlarini duzelt
     async with engine.begin() as conn:
+        await _check_embedding_dim(conn)
+        # Runtime toparlama: acilistaki takili uretim durumlarini duzelt
         for statement in _RECOVER_STUCK_STATUSES:
             await conn.execute(text(statement))
 

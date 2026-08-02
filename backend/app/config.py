@@ -34,5 +34,25 @@ class Settings(BaseSettings):
 
     cors_origins: str = "http://localhost:5173"
 
+    # --- Depolama/kotuye kullanim sinirlari (ADIM 2) ---
+    # Bolum metni: HEM yazarin manuel duzenlemesinde (schemas.py Field) HEM DE LLM
+    # URETIMINDE (generation.py) uygulanir. Ikincisi kritik: BYOK'ta base_url kullanicinin
+    # kendi sunucusu olabilir, yani "LLM yaniti" tamamen kullanicinin kontrolunde — Pydantic
+    # bunu goremez, tavan olmadan sinirsiz metin doğrudan DB'ye yazilirdi.
+    max_chapter_chars: int = 60_000
+    max_story_description_chars: int = 2_000
+    max_entity_description_chars: int = 2_000
+    # Ozet alanlari: TASMA -> KIRPMA degil, uretim BASARISIZ sayilir (None doner). Sessizce
+    # kirpilmis bir ozet ileri bolumlerin tek bilgi kaynagi olarak yanlis kalir; mevcut lazy
+    # telafi (chapter.summary=None -> bir sonraki uretimde yeniden dene; arc summary=None ->
+    # ensure_rollup o ark satirini hic yazmaz, prompt ham ozetlere duser) bunu zaten karsiliyor.
+    max_chapter_summary_chars: int = 2_000
+    max_arc_summary_chars: int = 6_000
+    # Kullanici basina hikaye sayisi ve hikaye basina bolum/toplam-karakter tavani:
+    # ham metin depolamayi hicbir sey sinirlamiyordu, import ozelligi gelmeden kapatilmali.
+    max_stories_per_user: int = 50
+    max_chapters_per_story: int = 1_000
+    max_story_total_chars: int = 3_000_000
+
 
 settings = Settings()

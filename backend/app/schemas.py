@@ -1,23 +1,28 @@
 from datetime import datetime
+from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
 from .ai.prompts import LAST_CHAPTERS_MAX, LAST_CHAPTERS_MIN
+from .config import settings
 from .models import Story
+from .params import IdField
 
 # Girdi tavanlari (kotuye kullanim / prompt sisirme onlemi)
 MAX_PROMPT_LEN = 5_000     # kullanici talimatlari (konu, hamle, style/negative)
 MAX_PROMPT_ITEM_LEN = 1_000  # tek bir talimat maddesi
 MAX_PROMPT_ITEMS = 50        # hikaye basina azami madde (prompt sisirme onlemi)
-MAX_DESCRIPTION_LEN = 2_000  # yayin aciklamasi (ana sayfa/arama)
 MAX_TAGS = 10                # hikaye basina azami etiket
 MAX_TAG_LEN = 32
 MAX_COMMENT_LEN = 2_000      # okuyucu yorumu
-MAX_CHAPTER_LEN = 60_000   # bolum metni
 MAX_SUMMARY_LEN = 2_000
 MAX_NAME_LEN = 120
-MAX_DESC_LEN = 2_000
+
+# Bunlar .env'den okunur (kodda sabit degil) — ADIM 2, bkz. config.py
+MAX_CHAPTER_LEN = settings.max_chapter_chars       # bolum metni
+MAX_DESCRIPTION_LEN = settings.max_story_description_chars  # yayin aciklamasi (ana sayfa/arama)
+MAX_DESC_LEN = settings.max_entity_description_chars         # entity (karakter/mekan/esya) aciklamasi
 
 
 class CamelModel(BaseModel):
@@ -82,7 +87,12 @@ class UpdatePublishingRequest(CamelModel):
 
     visibility: str = Field(pattern="^(private|unlisted|public)$")
     description: str | None = Field(default=None, max_length=MAX_DESCRIPTION_LEN)
-    tags: list[str] | None = Field(default=None, max_length=MAX_TAGS)
+    # max_length=MAX_TAGS listenin UZUNLUGUNU sinirlar, tek tek etiketin karakter sayisini
+    # DEGIL — o yuzden her etiket kendi Annotated str'iyle ayrica sinirlanir (aksi halde
+    # "10 etiket x 10MB" gibi bir govde Pydantic'e kadar sorunsuz ulasirdi).
+    tags: list[Annotated[str, Field(max_length=MAX_TAG_LEN)]] | None = Field(
+        default=None, max_length=MAX_TAGS
+    )
     is_adult: bool = False
     rules_accepted: bool = False
 
@@ -117,7 +127,7 @@ class UpdatePromptItemRequest(CamelModel):
 class ReorderPromptItemsRequest(CamelModel):
     """Maddelerin YENI sirasi: id listesi, istenen sirada. Listede olmayanlar sona alinir."""
 
-    item_ids: list[int] = Field(max_length=MAX_PROMPT_ITEMS)
+    item_ids: list[IdField] = Field(max_length=MAX_PROMPT_ITEMS)
 
 
 class ElementRequest(CamelModel):
@@ -126,7 +136,7 @@ class ElementRequest(CamelModel):
 
 
 class CreateElementRequest(CamelModel):
-    story_id: int
+    story_id: IdField
     name: str = Field(max_length=MAX_NAME_LEN)
     description: str = Field(default="", max_length=MAX_DESC_LEN)
 

@@ -19,6 +19,7 @@ from ..ai.prompts import (
     join_sections,
     token_breakdown,
 )
+from ..config import settings
 from ..database import SessionLocal
 from ..models import Chapter, Character, Chunk, Event, Item, Location, Story
 from ..schemas import story_detail
@@ -156,12 +157,23 @@ async def _generate_chapter(db: AsyncSession, story_id: int, user_action: str | 
     parsed, usage = await ai.chat_json_with_usage(
         ctx, ctx.story_model, system_prompt, user_message, temperature=0.8
     )
-    content = str(parsed.get("content") or "").strip()
+    # KRITIK: bu deger Pydantic'ten GECMEZ. BYOK'ta base_url kullanicinin kendi sunucusu
+    # olabilir; "LLM yaniti" tumuyle onun kontrolunde, max_tokens gibi istek parametrelerine
+    # uymak zorunda degil. Tavan olmadan sinirsiz metin dogrudan DB'ye yazilirdi.
+    content = str(parsed.get("content") or "").strip()[: settings.max_chapter_chars]
     if not content:
         raise ValueError("Model boş bölüm içeriği döndürdü.")
 
-    # Bolum ozeti ayni cevaptan gelir; modelin yeni yazdigini en iyi yine kendisi ozetler
-    summary = str(parsed.get("chapter_summary") or "").strip()[:2000] or None
+    # Bolum ozeti ayni cevaptan gelir; modelin yeni yazdigini en iyi yine kendisi ozetler.
+    # Tavani asarsa KIRPILMAZ: None birakilir, asagidaki "chapter_summary vermediyse telafi
+    # et" yolu zaten devreye girer (bkz. config.py max_chapter_summary_chars yorumu).
+    summary = str(parsed.get("chapter_summary") or "").strip() or None
+    if summary and len(summary) > settings.max_chapter_summary_chars:
+        logger.warning(
+            "Hikaye %s: chapter_summary tavani asti (%s karakter), telafiye birakildi",
+            story_id, len(summary),
+        )
+        summary = None
 
     # NOT: chapters.embedding artik YAZILMAZ. Retrieval olay-embed'e (OpenAI uzayi) tasindi;
     # eski kolon GEMINI uzayindadir, dokunulmaz (yeni bolumlerde NULL kalir, sorgulanmaz).
@@ -312,7 +324,12 @@ async def _repair_missing_derivatives(db: AsyncSession, story: Story, ctx: LlmCt
 
 
 async def summarize_chapter(ctx: LlmCtx, content: str) -> str | None:
-    """Tek bolumun 2-3 cumlelik ozeti (uretim disi yollarda da kullanilir: bolum duzenleme)."""
+    """Tek bolumun 2-3 cumlelik ozeti (uretim disi yollarda da kullanilir: bolum duzenleme).
+
+    KRITIK: bu deger de Pydantic'ten GECMEZ (bkz. content icin ayni not) — BYOK'ta yanit
+    tumuyle kullanicinin sunucusunun kontrolunde. Tavani asan cikti KIRPILMAZ, basarisiz
+    sayilir (None) — cagiranlarin hepsi zaten None'i "ozet uretilemedi, sonra tekrar
+    denenir" olarak ele aliyor (bkz. config.py max_chapter_summary_chars yorumu)."""
     text = await ai.chat_text(
         ctx,
         ctx.util_model,
@@ -322,7 +339,11 @@ async def summarize_chapter(ctx: LlmCtx, content: str) -> str | None:
         max_tokens=512,
         reasoning=False,  # util isi: reasoning gereksiz + output olarak faturalanir
     )
-    return text.strip() or None
+    summary = text.strip() or None
+    if summary and len(summary) > settings.max_chapter_summary_chars:
+        logger.warning("summarize_chapter: tavan asildi (%s karakter), basarisiz sayildi", len(summary))
+        return None
+    return summary
 
 
 async def apply_new_entities_from_edit(

@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..database import get_db
 from ..models import Character, Item, Location, Story, User
+from ..params import IdPath
 from ..schemas import CreateElementRequest, ElementRequest
 from ..security import get_current_user
 from ..services.generation import embed_entities_safely, entity_embed_text
@@ -67,7 +68,7 @@ async def _get_owned_element(kind: str, element_id: int, user: User, db: AsyncSe
 @router.put("/{kind}/{element_id}")
 async def update_element(
     kind: str,
-    element_id: int,
+    element_id: IdPath,
     request: ElementRequest,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -98,7 +99,7 @@ async def update_element(
 @router.delete("/{kind}/{element_id}")
 async def delete_element(
     kind: str,
-    element_id: int,
+    element_id: IdPath,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
