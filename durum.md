@@ -21,10 +21,14 @@ modu UI) → Faz 4 (moderasyon + operasyon).
 
 ## Sunucu
 
-- Azure VM, **Poland Central**, **B2ls_v2** (2 vCPU / 4 GB)
-- Statik IP: **74.248.32.128** → site adresi `74-248-32-128.sslip.io`
+**VM SİLİNDİ — yeniden kurulacak.** Eski statik IP geçersiz; kayıtlarda artık
+yer tutucu duruyor.
+
+- Hedef yapılandırma: Azure VM, **Poland Central**, **B2ls_v2** (2 vCPU / 4 GB)
+- Statik IP: `A.B.C.D` → site adresi `A-B-C-D.sslip.io` (yeni sunucu açılınca
+  gerçek değer buraya ve DEPLOY.md'ye yazılacak)
 - NSG: yalnızca 22, 80, 443
-- Not: DEPLOY.md'de West Europe + B2s yazıyor, güncellenmeli (o boyut abonelikte yoktu)
+- DEPLOY.md bu yapılandırmaya göre güncel (West Europe / B2s kalıntısı kalmadı)
 
 ---
 

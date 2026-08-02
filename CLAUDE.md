@@ -170,7 +170,7 @@ Olay katmanı iskeleti taşıyor ama **rastgele detayı kaçırıyor** ("1. böl
 ---
 
 ## FAZ 2.5 — Azure Deploy (SIRADAKİ)
-`DEPLOY.md`: Azure for Students → Ubuntu 24.04, B2ls_v2 (2 vCPU / 4 GB), Poland Central, SSH key, NSG yalnızca 22/80/443, Static IP (74.248.32.128) → docker+ufw → clone → `.env.prod` (sunucuda elle) → Caddyfile `74-248-32-128.sslip.io` → `up -d --build`. **Deploy öncesi: OpenAI + Google Cloud günlük hard spend cap ($5-10)** — embedding+showcase senin anahtarlarında.
+`DEPLOY.md`: Azure for Students → Ubuntu 24.04, B2ls_v2 (2 vCPU / 4 GB), Poland Central, SSH key, NSG yalnızca 22/80/443, Static IP (`A.B.C.D` — ilk VM silindi, yeni sunucuda gerçek değer yazılacak) → docker+ufw → clone → `.env.prod` (sunucuda elle) → Caddyfile `A-B-C-D.sslip.io` → `up -d --build`. **Deploy öncesi: OpenAI + Google Cloud günlük hard spend cap ($5-10)** — embedding+showcase senin anahtarlarında.
 Smoke test: HTTPS+kayıt/giriş(JWT+Google); BYOK üretim→SSE; eş zamanlı 409; düzenle+re-embed+arama; yayımla+oku+beğen+yorum; loglarda anahtar yok; restart sonrası veri duruyor.
 
 ## FAZ 3 — Import + Dev Modu UI + Prompt Şeffaflığı

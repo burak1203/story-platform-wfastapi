@@ -6,7 +6,10 @@ Sunucu alındığı gün bu adımlar sırayla uygulanır. Ön koşul: repo GitHu
 - **Ubuntu 24.04 LTS, B2ls_v2 (2 vCPU / 4 GB), Poland Central**, SSH key ile giriş
 - NSG gelen kurallar: yalnızca **22, 80, 443**
 - Public IP: **Static** (IP'yi not al: `A.B.C.D`)
-- IP: 74.248.32.128
+
+> **IP yer tutucu.** İlk VM silindi, eski IP artık geçersiz. Bu dosyada geçen
+> `A.B.C.D` ve `A-B-C-D.sslip.io` değerleri yeni sunucu açıldığında gerçek statik
+> IP ile değiştirilecek (nokta yerine tire: `1.2.3.4` → `1-2-3-4.sslip.io`).
 
 ## 0. Deploy ÖNCESİ (sunucuya dokunmadan, lokalde)
 

@@ -50,44 +50,54 @@ const handleDelete = async (id: number) => {
 </script>
 
 <template>
-  <div class="min-h-screen bg-slate-900 text-gray-200 font-sans p-8">
-    <header class="flex justify-between items-center mb-12 border-b border-slate-700 pb-6">
-      <h1 class="text-3xl font-bold text-amber-500">Hikayelerim</h1>
+  <!-- Kabuk artik yuzeyi ve temayi veriyor: sayfa kendi min-h-screen'ini ve sabit koyu
+       arka planini birakti. Kalmasaydi mobilde kabugun 48px ust cubugu ustune 100vh
+       binip ikinci bir kaydirma cikardi ve raydaki tema dugmesi bu sayfada islevsiz
+       gorunurdu. Kartlarin duzeni AYNI, yalnizca renkler temaya bagli. -->
+  <div class="mx-auto max-w-6xl p-4 sm:p-6 lg:p-8">
+    <header
+      class="flex flex-wrap justify-between items-center gap-3 mb-8 border-b border-slate-200 dark:border-slate-700 pb-6"
+    >
+      <h1 class="text-2xl sm:text-3xl font-bold text-amber-600 dark:text-amber-500">Hikayelerim</h1>
       <div class="flex gap-3">
         <button
           @click="llmKeyStore.openModal()"
-          class="text-sm bg-slate-800 hover:bg-slate-700 px-4 py-2 rounded border border-slate-600 transition-colors"
-          :class="{ 'border-amber-600 text-amber-500': !llmKeyStore.hasKey }"
+          class="text-sm bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 px-4 py-2 rounded border border-slate-300 dark:border-slate-600 transition-colors"
+          :class="{ 'border-amber-600 text-amber-600 dark:text-amber-500': !llmKeyStore.hasKey }"
         >
           🔑 API Anahtarı{{ llmKeyStore.hasKey ? '' : ' (gerekli)' }}
         </button>
         <button
           @click="handleLogout"
-          class="text-sm bg-slate-800 hover:bg-slate-700 px-4 py-2 rounded border border-slate-600 transition-colors"
+          class="text-sm bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 px-4 py-2 rounded border border-slate-300 dark:border-slate-600 transition-colors"
         >
           Çıkış Yap
         </button>
       </div>
     </header>
 
-    <div class="max-w-6xl mx-auto grid grid-cols-1 md:grid-cols-3 gap-6">
+    <!-- 375px: tek sutun. Onceki md:grid-cols-3 tek kirilimdi, dar masaustunde kartlar
+         eziliyordu; sm ara basamagi eklendi. -->
+    <div class="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-3">
       <div
-        class="bg-slate-800/50 border-2 border-dashed border-slate-600 rounded-xl p-6 flex flex-col justify-center transition-colors"
+        class="bg-slate-100/60 dark:bg-slate-800/50 border-2 border-dashed border-slate-300 dark:border-slate-600 rounded-xl p-6 flex flex-col justify-center transition-colors"
         :class="{ 'hover:border-amber-500': !isCreating }"
       >
         <div v-if="!isCreating" @click="isCreating = true" class="cursor-pointer text-center py-8">
-          <div class="text-4xl text-slate-500 mb-2">+</div>
-          <div class="font-bold text-slate-400">Yeni Serüven Başlat</div>
+          <div class="text-4xl text-slate-400 dark:text-slate-500 mb-2">+</div>
+          <div class="font-bold text-slate-500 dark:text-slate-400">Yeni Serüven Başlat</div>
         </div>
 
         <form v-else @submit.prevent="handleCreateStory" class="flex flex-col gap-4">
-          <h2 class="text-lg font-bold text-amber-500 mb-2">Başlangıç Kurulumu</h2>
+          <h2 class="text-lg font-bold text-amber-600 dark:text-amber-500 mb-2">
+            Başlangıç Kurulumu
+          </h2>
 
           <input
             v-model="newTitle"
             type="text"
             placeholder="Hikaye Başlığı (Örn: Mars Kolonisi)"
-            class="bg-slate-900 border border-slate-700 rounded px-4 py-2 text-sm focus:outline-none focus:border-amber-500"
+            class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded px-4 py-2 text-sm focus:outline-none focus:border-amber-500"
             required
             :disabled="storyStore.isLoading"
           />
@@ -96,7 +106,7 @@ const handleDelete = async (id: number) => {
             v-model="newPrompt"
             rows="4"
             placeholder="Nasıl başlıyoruz? (Örn: Gözlerimi açtığımda kırmızı kumlar fırtınayla savruluyordu...)"
-            class="bg-slate-900 border border-slate-700 rounded px-4 py-2 text-sm focus:outline-none focus:border-amber-500 resize-none"
+            class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded px-4 py-2 text-sm focus:outline-none focus:border-amber-500 resize-none"
             required
             :disabled="storyStore.isLoading"
           ></textarea>
@@ -112,14 +122,14 @@ const handleDelete = async (id: number) => {
             <button
               type="button"
               @click="isCreating = false"
-              class="bg-slate-700 hover:bg-slate-600 px-4 rounded transition-colors"
+              class="bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 px-4 rounded transition-colors"
               :disabled="storyStore.isLoading"
             >
               İptal
             </button>
           </div>
 
-          <div v-if="storyStore.error" class="text-red-400 text-xs mt-2">
+          <div v-if="storyStore.error" class="text-red-600 dark:text-red-400 text-xs mt-2">
             {{ storyStore.error }}
           </div>
         </form>
@@ -129,13 +139,16 @@ const handleDelete = async (id: number) => {
         v-for="story in storyStore.myStories"
         :key="story.id"
         @click="goToStudio(story.id)"
-        class="bg-slate-800 border border-slate-700 rounded-xl p-6 cursor-pointer hover:bg-slate-750 hover:border-slate-500 transition-all flex flex-col h-64"
+        class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl p-6 cursor-pointer hover:border-slate-400 dark:hover:border-slate-500 transition-all flex flex-col h-64"
       >
         <div class="flex justify-between items-start mb-4">
-          <h3 class="text-xl font-bold text-slate-100 truncate pr-4">{{ story.title }}</h3>
+          <h3 class="text-xl font-bold text-slate-900 dark:text-slate-100 truncate pr-4">
+            {{ story.title }}
+          </h3>
 
           <div class="flex gap-2 items-center">
-            <span class="bg-slate-700 text-xs px-2 py-1 rounded text-slate-300"
+            <span
+              class="bg-slate-100 dark:bg-slate-700 text-xs px-2 py-1 rounded text-slate-600 dark:text-slate-300"
               >Hamle: {{ story.actionCount }}</span
             >
             <button
@@ -161,13 +174,17 @@ const handleDelete = async (id: number) => {
           </div>
         </div>
 
-        <div class="flex-1 text-sm text-slate-400 overflow-hidden relative">
-          <div class="absolute inset-0 bg-gradient-to-b from-transparent to-slate-800"></div>
+        <!-- Solma perdesi kart yuzeyiyle AYNI rengi tutmali; sabit slate-800 kalsaydi
+             acik temada metnin uzerine gri bir bant binerdi. -->
+        <div class="flex-1 text-sm text-slate-500 dark:text-slate-400 overflow-hidden relative">
+          <div
+            class="absolute inset-0 bg-gradient-to-b from-transparent to-white dark:to-slate-800"
+          ></div>
           {{ story.currentSummary || 'Henüz içerik yok...' }}
         </div>
 
         <div
-          class="mt-4 pt-4 border-t border-slate-700 flex justify-between text-xs text-slate-500"
+          class="mt-4 pt-4 border-t border-slate-200 dark:border-slate-700 flex justify-between text-xs text-slate-500"
         >
           <span
             >Durum:

@@ -371,7 +371,16 @@ watch(drawerOpen, async (open) => {
       </header>
 
       <main class="min-w-0">
-        <RouterView />
+        <!-- :key ZORUNLU. vue-router yalnizca PARAMETRE degisince bileseni yeniden
+             yaratmaz, ayni ornegi kullanir: /studio/1 -> /studio/2 gecisinde StudioView'in
+             onMounted'i bir daha kosmaz, ekran hikaye 1'de kalirdi. Yola gore anahtarlamak
+             o gecisi gercek bir unmount+mount yapar; boylece hem veri yeniden cekilir
+             hem de hikayeye BAGLI tum yerel taslaklar (bolum/ozet/varlik/talimat
+             duzenleme, yayimlama formu) sifirlanir ve onUnmounted'daki disconnectStream
+             calisip eski SSE baglantisi kapanir.
+             Farkli bilesenli rotalar (dashboard/settings) zaten remount oluyordu; bu
+             anahtar yalnizca "ayni bilesen, farkli parametre" halini degistirir. -->
+        <RouterView :key="route.path" />
       </main>
     </div>
   </div>

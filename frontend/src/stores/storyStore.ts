@@ -93,6 +93,14 @@ export const useStoryStore = defineStore('story', {
     },
 
     async fetchStory(storyId: number) {
+      // Baska bir hikayeden geliniyorsa ONCE eskisini bosalt. Aksi halde istek donene
+      // kadar (ya da hic donmezse) /studio/2 adresinde hikaye 1'in basligi ve bolumleri
+      // duruyordu. Eski akisi da burada kapatiyoruz: yanit gecikirken gelen bir
+      // STORY_UPDATE eski hikayeyi geri yazabilirdi.
+      if (this.story && this.story.id !== storyId) {
+        this.disconnectStream()
+        this.story = null
+      }
       this.isLoading = true
       this.error = null
       try {

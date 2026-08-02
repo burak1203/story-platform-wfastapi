@@ -262,22 +262,48 @@ const saveNewElement = async () => {
 }
 
 const elementSections = computed(() => [
-  { kind: 'characters' as ElementKind, title: 'Karakterler', color: 'text-amber-500', items: store.story?.characters || [] },
-  { kind: 'locations' as ElementKind, title: 'Mekanlar', color: 'text-emerald-500', items: store.story?.locations || [] },
-  { kind: 'items' as ElementKind, title: 'Eşyalar', color: 'text-cyan-500', items: store.story?.items || [] },
+  {
+    kind: 'characters' as ElementKind,
+    title: 'Karakterler',
+    color: 'text-amber-500',
+    items: store.story?.characters || [],
+  },
+  {
+    kind: 'locations' as ElementKind,
+    title: 'Mekanlar',
+    color: 'text-emerald-500',
+    items: store.story?.locations || [],
+  },
+  {
+    kind: 'items' as ElementKind,
+    title: 'Eşyalar',
+    color: 'text-cyan-500',
+    items: store.story?.items || [],
+  },
 ])
 </script>
 
 <template>
-  <div class="h-screen w-full bg-slate-900 text-gray-200 flex overflow-hidden font-sans">
+  <!-- Yukseklik kabuktan ARTAN alan kadar: duz h-screen mobilde kabugun 48px'lik ust
+       cubugunun ustune 100vh bindiriyor, sayfanin tamami 48px kayiyor ve ikinci bir
+       kaydirma cubugu cikiyordu. Masaustunde ust cubuk yok, orada tam 100vh dogru.
+       NOT: Stüdyo bilinçli olarak koyu bir calisma yuzeyi — kabugun temasini takip
+       etmiyor (bkz. bitis raporu). -->
+  <div
+    class="h-[calc(100vh-3rem)] lg:h-screen w-full bg-slate-900 text-gray-200 flex overflow-hidden font-sans"
+  >
     <!-- SOL PANEL: Ayarlar ve Bölüm Özetleri -->
     <aside class="w-1/4 bg-slate-800 border-r border-slate-700 p-6 flex flex-col">
       <h1 class="text-2xl font-bold text-amber-500 mb-2">
         {{ store.story?.title || 'Yükleniyor...' }}
       </h1>
       <div class="flex items-center gap-2 mb-4 text-sm text-slate-400">
-        <span class="bg-slate-700 px-2 py-1 rounded">Durum: {{ store.story?.status || '...' }}</span>
-        <span class="bg-slate-700 px-2 py-1 rounded">Bölüm: {{ store.story?.actionCount || 0 }}</span>
+        <span class="bg-slate-700 px-2 py-1 rounded"
+          >Durum: {{ store.story?.status || '...' }}</span
+        >
+        <span class="bg-slate-700 px-2 py-1 rounded"
+          >Bölüm: {{ store.story?.actionCount || 0 }}</span
+        >
         <button
           @click="llmKeyStore.openModal()"
           class="bg-slate-700 hover:bg-slate-600 px-2 py-1 rounded transition-colors"
@@ -306,7 +332,9 @@ const elementSections = computed(() => [
           <!-- Talimat maddeleri: tek tek açılıp kapanır, sıralanır -->
           <div v-for="section in promptSections" :key="section.kind" class="flex flex-col gap-2">
             <label class="text-xs text-slate-500">{{ section.title }}</label>
-            <p v-if="!section.items.length" class="text-xs text-slate-600 italic">Henüz talimat yok.</p>
+            <p v-if="!section.items.length" class="text-xs text-slate-600 italic">
+              Henüz talimat yok.
+            </p>
 
             <div
               v-for="(item, index) in section.items"
@@ -325,7 +353,8 @@ const elementSections = computed(() => [
                   <span
                     class="text-xs leading-relaxed flex-1 whitespace-pre-wrap"
                     :class="item.enabled ? 'text-slate-300' : 'text-slate-600 line-through'"
-                  >{{ item.text }}</span>
+                    >{{ item.text }}</span
+                  >
                 </div>
                 <div class="flex gap-2 justify-end text-xs text-slate-500">
                   <button
@@ -333,13 +362,17 @@ const elementSections = computed(() => [
                     :disabled="index === 0"
                     class="hover:text-amber-500 disabled:opacity-30 disabled:hover:text-slate-500"
                     title="Yukarı taşı"
-                  >↑</button>
+                  >
+                    ↑
+                  </button>
                   <button
                     @click="moveItem(section.kind, index, 1)"
                     :disabled="index === section.items.length - 1"
                     class="hover:text-amber-500 disabled:opacity-30 disabled:hover:text-slate-500"
                     title="Aşağı taşı"
-                  >↓</button>
+                  >
+                    ↓
+                  </button>
                   <button @click="startItemEdit(item)" class="hover:text-amber-500">✎</button>
                   <button @click="removeItem(item)" class="hover:text-red-500">✕</button>
                 </div>
@@ -352,8 +385,18 @@ const elementSections = computed(() => [
                   class="bg-slate-900 border border-slate-600 rounded p-2 text-xs focus:outline-none focus:border-amber-500 resize-none"
                 ></textarea>
                 <div class="flex gap-2 justify-end">
-                  <button @click="editingItemId = null" class="text-xs text-slate-400 hover:text-slate-200">İptal</button>
-                  <button @click="saveItemEdit" class="text-xs bg-amber-600 hover:bg-amber-500 text-slate-900 font-bold px-3 py-1 rounded">Kaydet</button>
+                  <button
+                    @click="editingItemId = null"
+                    class="text-xs text-slate-400 hover:text-slate-200"
+                  >
+                    İptal
+                  </button>
+                  <button
+                    @click="saveItemEdit"
+                    class="text-xs bg-amber-600 hover:bg-amber-500 text-slate-900 font-bold px-3 py-1 rounded"
+                  >
+                    Kaydet
+                  </button>
                 </div>
               </div>
             </div>
@@ -400,8 +443,8 @@ const elementSections = computed(() => [
             </div>
             <p class="text-xs text-slate-600 leading-relaxed">
               Daha fazlası tutarlılığı artırır ama yaratıcılığı düşürür ve token maliyetini
-              yükseltir. Süreklilik zayıfsa çözüm genelde daha çok ham bölüm değil, daha iyi
-              hafıza aramasıdır. (1-5, varsayılan 2)
+              yükseltir. Süreklilik zayıfsa çözüm genelde daha çok ham bölüm değil, daha iyi hafıza
+              aramasıdır. (1-5, varsayılan 2)
             </p>
           </div>
         </div>
@@ -426,7 +469,10 @@ const elementSections = computed(() => [
           {{ showPublishing ? '▾' : '▸' }}
         </button>
 
-        <div v-if="showPublishing" class="p-3 pt-0 flex flex-col gap-3 overflow-y-auto max-h-[55vh] min-h-0">
+        <div
+          v-if="showPublishing"
+          class="p-3 pt-0 flex flex-col gap-3 overflow-y-auto max-h-[55vh] min-h-0"
+        >
           <div class="flex flex-col gap-1">
             <label class="text-xs text-slate-500">Görünürlük</label>
             <select
@@ -461,10 +507,16 @@ const elementSections = computed(() => [
 
           <label class="flex items-start gap-2 text-xs text-slate-400">
             <input v-model="pubIsAdult" type="checkbox" class="mt-0.5" />
-            <span>Yetişkin içerik. <b class="text-slate-500">Bu işaretliyken herkese açık yayımlanamaz.</b></span>
+            <span
+              >Yetişkin içerik.
+              <b class="text-slate-500">Bu işaretliyken herkese açık yayımlanamaz.</b></span
+            >
           </label>
 
-          <label v-if="pubVisibility === 'public'" class="flex items-start gap-2 text-xs text-slate-400">
+          <label
+            v-if="pubVisibility === 'public'"
+            class="flex items-start gap-2 text-xs text-slate-400"
+          >
             <input v-model="pubRulesAccepted" type="checkbox" class="mt-0.5" />
             <span>İçerik kurallarını okudum ve kabul ediyorum.</span>
           </label>
@@ -489,8 +541,8 @@ const elementSections = computed(() => [
           </a>
 
           <p class="text-xs text-slate-600 leading-relaxed">
-            Yayımlanan hikayede yeni bölümler üretildikçe okurlara görünür — ayrı bir
-            "yayımla" adımı yok.
+            Yayımlanan hikayede yeni bölümler üretildikçe okurlara görünür — ayrı bir "yayımla"
+            adımı yok.
           </p>
         </div>
       </div>
@@ -500,9 +552,7 @@ const elementSections = computed(() => [
         Bölüm Özetleri
       </h2>
       <div class="flex-1 overflow-y-auto pr-2 flex flex-col gap-3">
-        <p v-if="!store.story?.chapters?.length" class="text-sm text-slate-500">
-          Henüz bölüm yok.
-        </p>
+        <p v-if="!store.story?.chapters?.length" class="text-sm text-slate-500">Henüz bölüm yok.</p>
         <div
           v-for="chapter in store.story?.chapters"
           :key="'sum-' + chapter.id"
@@ -518,7 +568,10 @@ const elementSections = computed(() => [
               düzenle
             </button>
           </div>
-          <p v-if="editingSummaryIndex !== chapter.index" class="text-xs leading-relaxed text-slate-300">
+          <p
+            v-if="editingSummaryIndex !== chapter.index"
+            class="text-xs leading-relaxed text-slate-300"
+          >
             {{ chapter.summary || '(özet yok)' }}
           </p>
           <div v-else class="flex flex-col gap-2">
@@ -528,8 +581,18 @@ const elementSections = computed(() => [
               class="bg-slate-900 border border-slate-600 rounded p-2 text-xs focus:outline-none focus:border-amber-500 resize-none"
             ></textarea>
             <div class="flex gap-2 justify-end">
-              <button @click="editingSummaryIndex = null" class="text-xs text-slate-400 hover:text-slate-200">İptal</button>
-              <button @click="saveSummaryEdit" class="text-xs bg-amber-600 hover:bg-amber-500 text-slate-900 font-bold px-3 py-1 rounded">Kaydet</button>
+              <button
+                @click="editingSummaryIndex = null"
+                class="text-xs text-slate-400 hover:text-slate-200"
+              >
+                İptal
+              </button>
+              <button
+                @click="saveSummaryEdit"
+                class="text-xs bg-amber-600 hover:bg-amber-500 text-slate-900 font-bold px-3 py-1 rounded"
+              >
+                Kaydet
+              </button>
             </div>
           </div>
         </div>
@@ -546,13 +609,11 @@ const elementSections = computed(() => [
       </div>
 
       <div ref="scrollContainer" class="flex-1 overflow-y-auto p-10 pb-36">
-        <div
-          v-for="chapter in chapters"
-          :key="'ch-' + chapter.id"
-          class="mb-10"
-        >
+        <div v-for="chapter in chapters" :key="'ch-' + chapter.id" class="mb-10">
           <div class="flex justify-between items-center mb-3 border-b border-slate-800 pb-2">
-            <span class="text-sm font-bold text-slate-500 uppercase tracking-wider">Bölüm {{ chapter.index }}</span>
+            <span class="text-sm font-bold text-slate-500 uppercase tracking-wider"
+              >Bölüm {{ chapter.index }}</span
+            >
             <button
               v-if="editingChapterIndex !== chapter.index && !isBusy"
               @click="startChapterEdit(chapter.index, chapter.content)"
@@ -565,7 +626,9 @@ const elementSections = computed(() => [
           <div
             v-if="editingChapterIndex !== chapter.index"
             class="max-w-none text-gray-100 leading-relaxed whitespace-pre-wrap"
-          >{{ chapter.content }}</div>
+          >
+            {{ chapter.content }}
+          </div>
 
           <div v-else class="flex flex-col gap-3">
             <textarea
@@ -589,7 +652,8 @@ const elementSections = computed(() => [
               </button>
             </div>
             <p class="text-xs text-slate-500 text-right">
-              Kaydedince özet ve hafıza güncellenir; yapay zeka bir sonraki bölümde değişikliği bilir.
+              Kaydedince özet ve hafıza güncellenir; yapay zeka bir sonraki bölümde değişikliği
+              bilir.
             </p>
           </div>
         </div>
@@ -669,12 +733,24 @@ const elementSections = computed(() => [
             :key="section.kind + '-' + element.id"
             class="bg-slate-700/40 p-3 rounded border border-slate-600"
           >
-            <template v-if="!(editingElement?.kind === section.kind && editingElement?.id === element.id)">
+            <template
+              v-if="!(editingElement?.kind === section.kind && editingElement?.id === element.id)"
+            >
               <div class="flex justify-between items-start">
                 <div class="font-bold text-sm text-slate-200">{{ element.name }}</div>
                 <div class="flex gap-2 text-xs">
-                  <button @click="startElementEdit(section.kind, element)" class="text-slate-500 hover:text-amber-500">✎</button>
-                  <button @click="removeElement(section.kind, element.id)" class="text-slate-500 hover:text-red-500">✕</button>
+                  <button
+                    @click="startElementEdit(section.kind, element)"
+                    class="text-slate-500 hover:text-amber-500"
+                  >
+                    ✎
+                  </button>
+                  <button
+                    @click="removeElement(section.kind, element.id)"
+                    class="text-slate-500 hover:text-red-500"
+                  >
+                    ✕
+                  </button>
                 </div>
               </div>
               <div class="text-xs text-slate-400 mt-1">{{ element.description }}</div>
@@ -695,8 +771,18 @@ const elementSections = computed(() => [
                 class="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs focus:outline-none focus:border-amber-500 resize-none"
               ></textarea>
               <div class="flex gap-2 justify-end">
-                <button @click="editingElement = null" class="text-xs text-slate-400 hover:text-slate-200">İptal</button>
-                <button @click="saveElementEdit" class="text-xs bg-amber-600 hover:bg-amber-500 text-slate-900 font-bold px-3 py-1 rounded">Kaydet</button>
+                <button
+                  @click="editingElement = null"
+                  class="text-xs text-slate-400 hover:text-slate-200"
+                >
+                  İptal
+                </button>
+                <button
+                  @click="saveElementEdit"
+                  class="text-xs bg-amber-600 hover:bg-amber-500 text-slate-900 font-bold px-3 py-1 rounded"
+                >
+                  Kaydet
+                </button>
               </div>
             </div>
           </div>
