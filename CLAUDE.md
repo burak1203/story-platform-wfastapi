@@ -95,6 +95,11 @@ Neden ikisi de: olayları "eksiksiz" yapmaya çalışma — LLM'den eksiksizlik 
 - Frontend'de `v-html` YASAK; kullanıcı/LLM içeriği text render (`white-space: pre-wrap`).
 - Her yeni uçta üç soru: auth zorunlu mu, sahiplik/görünürlük (IDOR) var mı, Pydantic max limit var mı.
 - Tek uvicorn worker (kilit süreç içi olabilir); worker artırmadan kilit DB-atomik olmalı.
+  Süreç-içi kilit/durum örnekleri: `generation.py`'deki `_story_locks`, `security.py`'deki
+  `_used_stream_jti` (SSE stream-token tek-kullanımlık takibi). Worker artırılırsa ikisi de
+  DB/Redis'e taşınmalı — aksi halde her worker kendi hafızasında ayrı ayrı "kullanıldı" sayar
+  ve garanti worker başına parçalanır (ör. aynı token iki farklı worker'a düşerse ikisi de
+  kabul eder).
 - Prod'da `DEBUG=False`; ham stack-trace kullanıcıya dönmez.
 - Küçük kararı kendin ver; mimari değişikliğinde tek cümle öneriyle sor.
 

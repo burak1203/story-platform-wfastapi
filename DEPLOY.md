@@ -23,6 +23,10 @@ Sunucu alındığı gün bu adımlar sırayla uygulanır. Ön koşul: repo GitHu
       (`docker run --rm --entrypoint sh <imaj> -c "pip install -q pip-audit && pip-audit"`)
 - [ ] `.env.prod.example` içinde **üretim LLM anahtarı YOK** (BYOK: base URL + model +
       anahtar üçü de kullanıcının tarayıcısından gelir)
+- [ ] Bilgi: zayıf `JWT_SECRET` (32 byte altı/varsayılan), boş `EMBEDDING_API_KEY` ya da
+      varsayılan `DATABASE_URL` şifresi ile backend `ENV=production`'da artık **açılmıyor**
+      (bkz. `config.py` `validate_production_settings`) — `.env.prod`'u yanlış doldurursan
+      bunu smoke test'te değil, ilk `docker compose up` loglarında göreceksin.
 
 ## 1. VM temel kurulum
 

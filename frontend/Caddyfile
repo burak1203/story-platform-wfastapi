@@ -27,4 +27,25 @@
 		X-Frame-Options "DENY"
 		X-Content-Type-Options "nosniff"
 	}
+
+	# Ek katman, ana savunma DEGIL: stream-token uc-kullanimlik + ~60sn omurlu (bkz.
+	# security.py create_stream_token). Yine de erisim logunda DUZ METIN durmasin diye
+	# query string'deki token degeri burada maskelenir.
+	#
+	# KAPSAM SINIRI (bilincli kabul edildi, KAPATILMADI): bu filtre YALNIZCA
+	# http.log.access'i kapsar. Backend'e ulasilamadiginda (dial hatasi vb.) Caddy ayri
+	# bir logger'a (http.log.error) yazar ve o satirda token MASKELENMEZ. Kapatmak icin
+	# handle_errors bloguyla o logger'i da ayni filtreden gecirmek gerekir ama bu
+	# Caddyfile'i karmasiklastirir ve yanlis yazilirsa SSE'yi bozma riski tasir — risk
+	# kazanctan buyuk: token zaten 60sn + tek kullanimlik, sizmasi icin backend'in TAM
+	# o anda erisilemez olmasi gerekir ki o durumda zaten kullanilamaz haldedir.
+	log {
+		format filter {
+			fields {
+				request>uri query {
+					replace token REDACTED
+				}
+			}
+		}
+	}
 }

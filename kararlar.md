@@ -108,6 +108,16 @@ render edilir. Strip etmek hem yazarın metnini bozar hem yanlış güvenlik his
 **Beğeni `ON CONFLICT DO NOTHING`.** `try/IntegrityError` deseni patlayan INSERT'le
 transaction'ı zehirler, sonraki sorgular da düşer.
  
+**SSE token'ı ana JWT değil, ayrı kısa ömürlü tek kullanımlık token.**
+`EventSource` header gönderemiyor, token'ın URL'e girmesi bu yüzden kaçınılmaz —
+soru "ne girecek" sorusu. Fetch tabanlı SSE'ye geçip token'ı Authorization
+header'ına taşımak (a) daha temiz olurdu ama SSE tüketimini (yeniden bağlanma,
+hata yönetimi) baştan yazmayı gerektiriyordu; güvenlik odaklı bir değişiklik için
+gereksiz büyük bir yüzey. Bunun yerine (b): normal JWT'yle (header'dan, loglanmaz)
+alınan, yalnızca tek bir hikayenin stream'i için geçerli, ~60sn ömürlü, tek
+kullanımlık ayrı bir token URL'e giriyor. Sızsa bile (log, tarayıcı geçmişi,
+referrer) değeri neredeyse sıfır — meşru istemci onu zaten tüketmiş oluyor.
+ 
 ---
  
 ## İçerik politikası

@@ -17,6 +17,7 @@ from .config import settings
 GENERATION_LIMIT = "3/minute"  # LLM'e giden pahali uclar (uretim, bolum duzenleme)
 AUTH_LIMIT = "5/minute"        # kayit/giris (IP basina; brute-force onlemi)
 SEARCH_LIMIT = "20/minute"     # embed harcayan arama (yazarin hikaye ici aramasi)
+STREAM_TOKEN_LIMIT = "30/minute"  # SSE stream-token uretimi (ucuz ama sinirsiz olmasin)
 
 # Public okuma uclari: auth'suz erisilir, cogu istek IP basina sayilir.
 # Okuma GEVSEK (okur bolum bolum gezer), arama daha SIKI (full-text tarama + kazima onlemi).

@@ -42,8 +42,8 @@ from ..schemas import (
     story_detail,
     story_summary,
 )
-from ..ratelimit import GENERATION_LIMIT, SEARCH_LIMIT, limiter
-from ..security import get_current_user, get_llm_ctx
+from ..ratelimit import GENERATION_LIMIT, SEARCH_LIMIT, STREAM_TOKEN_LIMIT, limiter
+from ..security import create_stream_token, get_current_user, get_llm_ctx, get_stream_user
 from ..services.generation import (
     apply_new_entities_from_edit,
     rebuild_chapter_chunks,
@@ -587,9 +587,24 @@ async def search_story(
     return results
 
 
+@router.post("/{story_id}/stream-token")
+@limiter.limit(STREAM_TOKEN_LIMIT)
+async def create_stream_token_endpoint(
+    request: Request,
+    story_id: IdPath,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """SSE ucu icin kisa omurlu (~60sn), tek kullanimlik, bu story_id'ye baglanmis token
+    uretir. Bu uc normal Authorization header'iyla korunur (loglanmaz); doner deger
+    EventSource'un URL'ine gidecek olan asil sey — ama ana JWT DEGIL, ayri ve dar kapsamli."""
+    await _get_owned_story(story_id, user, db)
+    return {"token": create_stream_token(user.username, story_id)}
+
+
 @router.get("/{story_id}/stream")
 async def stream_story(
-    story_id: IdPath, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+    story_id: IdPath, user: User = Depends(get_stream_user), db: AsyncSession = Depends(get_db)
 ):
     await _get_owned_story(story_id, user, db)
     queue = broker.subscribe(story_id)

@@ -1,4 +1,8 @@
+import logging
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -56,3 +60,60 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+# --- Prod acilis denetimi: _check_embedding_dim (database.py) ile AYNI desen ---
+# Sessiz yanlis yapilandirma bozuk calismaktan daha kotu; ENV=production'da bunlardan
+# biri guvensizse ACILMAZ. ENV != production'da (lokal gelistirme) ENGELLENMEZ — dev-secret
+# ile calismak mumkun kalir — ama uyari basilir, gozden kacmasin.
+MIN_JWT_SECRET_BYTES = 32
+_DEFAULT_JWT_SECRET = "dev-secret-change-me"
+# Substring karsilastirmasi (tam URL esitligi degil): host/port/db adini degistirip
+# sifreyi unutan biri de yakalansin.
+_DEFAULT_DB_PASSWORD_MARKER = "admin_password_123"
+
+
+def _production_config_problems(s: Settings) -> list[str]:
+    """DIKKAT: donen mesajlarda hicbir sirrin kendisi (JWT_SECRET, DATABASE_URL icindeki
+    sifre) YAZILMAZ — yalnizca uzunluk/varlik gibi sizdirmayan bilgiler."""
+    problems: list[str] = []
+
+    secret_bytes = len(s.jwt_secret.encode("utf-8"))
+    if secret_bytes < MIN_JWT_SECRET_BYTES or s.jwt_secret == _DEFAULT_JWT_SECRET:
+        problems.append(
+            f"JWT_SECRET zayif ({secret_bytes} byte, en az {MIN_JWT_SECRET_BYTES} gerekli "
+            "ve varsayilan degerde OLMAMALI). Uret: openssl rand -hex 32"
+        )
+
+    if not s.embedding_api_key:
+        # Bu SESSIZCE basarisiz olur (bkz. ai/embeddings.py _get_client): her embed cagrisi
+        # RuntimeError firlatir ama cagiran taraflar hepsi try/except icinde ("uretim
+        # BLOKLANMAZ" deseni) — yani hikaye uretimi calisir gibi gorunur, retrieval/arama
+        # sonsuza dek NULL embedding'lerle sessizce bos doner.
+        problems.append(
+            "EMBEDDING_API_KEY bos — embedding sessizce basarisiz olur, hicbir kayit "
+            "vektorlenmez ve arama/hafiza calismiyor gibi gorunmeden bozuk kalir."
+        )
+
+    if _DEFAULT_DB_PASSWORD_MARKER in s.database_url:
+        problems.append(
+            "DATABASE_URL hala ornek/varsayilan gelistirme sifresini iceriyor. "
+            "Guclu bir sifre uret (openssl rand -hex 16) ve hem POSTGRES_PASSWORD "
+            "hem de DATABASE_URL'de kullan."
+        )
+
+    return problems
+
+
+def validate_production_settings(s: Settings = settings) -> None:
+    problems = _production_config_problems(s)
+    if not problems:
+        return
+    if s.env == "production":
+        raise RuntimeError(
+            "Prod acilis reddedildi — asagidaki ayarlar guvensiz:\n- " + "\n- ".join(problems)
+        )
+    for problem in problems:
+        logger.warning(
+            "Guvensiz ayar (ENV=%s oldugu icin acilis ENGELLENMIYOR, ama prod'da ENGELLENIR): %s",
+            s.env, problem,
+        )

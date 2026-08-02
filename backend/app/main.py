@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from slowapi.errors import RateLimitExceeded
 
-from .config import settings
+from .config import settings, validate_production_settings
 from .database import init_db
 from .ratelimit import limiter, rate_limit_handler
 from .routers import auth, elements, llm, public, stories
@@ -17,6 +17,9 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # DB'ye hic dokunmadan, en erken noktada: zayif ayarla prod'a hic baglanmaya
+    # calisilmasin (bkz. config.py validate_production_settings).
+    validate_production_settings()
     await init_db()
     yield
 

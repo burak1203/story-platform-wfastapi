@@ -135,10 +135,23 @@ export const useStoryStore = defineStore('story', {
       }
     },
 
-    connectToStream(storyId: number) {
+    // EventSource header gonderemiyor, bu yuzden token URL'e girmek ZORUNDA — ama ana JWT
+    // DEGIL: burada once kisa omurlu (~60sn), tek kullanimlik, bu hikayeye ozel bir
+    // stream-token istenir (Authorization header'iyla, yani loglanmaz). URL'e giren SADECE
+    // bu dar kapsamli token; sizsa bile degeri neredeyse sifir.
+    async connectToStream(storyId: number) {
       this.disconnectStream()
 
-      const token = localStorage.getItem('token')
+      let token: string
+      try {
+        const response = await axios.post<{ token: string }>(`${API_URL}/${storyId}/stream-token`)
+        token = response.data.token
+      } catch {
+        // Canli akis kurulamadi ama hikaye zaten yuklendi; sessizce vazgec — kullanici
+        // sayfayi yenileyince ya da bir sonraki fetchStory'de tekrar denenir.
+        return
+      }
+
       this.eventSource = new EventSource(`${API_URL}/${storyId}/stream?token=${token}`)
 
       this.eventSource.addEventListener('STORY_UPDATE', (event) => {

@@ -1,3 +1,4 @@
+import secrets
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
@@ -10,6 +11,7 @@ from .ai.client import LlmCtx
 from .config import settings
 from .database import get_db
 from .models import User
+from .params import IdPath
 
 ALGORITHM = "HS256"
 
@@ -31,11 +33,15 @@ def create_token(username: str) -> str:
 
 
 def _extract_token(request: Request) -> str | None:
+    """YALNIZCA Authorization header'i. Eskiden SSE icin query string'e (?token=) de bakiyordu
+    (EventSource header gonderemedigi icin) — ama URL'e giren bir JWT erisim loguna DUZ METIN
+    dusuyor, tarayici gecmisine yaziliyor, referrer ile sizabiliyordu. SSE artik ayri, kisa
+    omurlu, tek-kullanimlik bir stream token kullaniyor (bkz. create_stream_token /
+    get_stream_user) — ana JWT hicbir zaman URL'e girmez."""
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
         return auth_header[7:]
-    # EventSource header gonderemedigi icin SSE ucunda ?token= destekleniyor
-    return request.query_params.get("token")
+    return None
 
 
 async def get_current_user(request: Request, db: AsyncSession = Depends(get_db)) -> User:
@@ -77,6 +83,84 @@ async def get_optional_user(
     if not username:
         return None
     return (await db.execute(select(User).where(User.username == username))).scalar_one_or_none()
+
+
+STREAM_TOKEN_PURPOSE = "stream"
+STREAM_TOKEN_TTL_SECONDS = 60
+
+# Tek-kullanimliktan gecmis jti'ler: jti -> (utc) son gecerlilik ani. Tek uvicorn worker
+# varsayimi projede zaten var (bkz. _story_locks, generation.py) — bu yuzden surec-ici bir
+# set yeterli, DB/Redis gerekmiyor. TTL kisa oldugu icin dict hicbir zaman buyumez; her
+# cagrida (hem consume hem de fazladan bir garanti icin burada) suresi gecenler budanir.
+_used_stream_jti: dict[str, datetime] = {}
+
+
+def _prune_used_stream_jti() -> None:
+    now = datetime.now(timezone.utc)
+    expired = [jti for jti, exp in _used_stream_jti.items() if exp <= now]
+    for jti in expired:
+        _used_stream_jti.pop(jti, None)
+
+
+def create_stream_token(username: str, story_id: int) -> str:
+    """SSE ucu icin, ANA JWT'DEN AYRI, dar kapsamli kisa omurlu token. EventSource header
+    gonderemedigi icin bu token query string'e girer (?token=...) — ama ana JWT'nin aksine
+    ~60sn sonra oleceginden ve TEK KULLANIMLIK oldugundan (bkz. consume), erisim loguna ya
+    da tarayici gecmisine dusse bile ele gecirilmesinin degeri neredeyse sifirdir. Yalnizca
+    bu story_id icin bu ucu acmaya yarar; baska hicbir uca karsi kullanilamaz (purpose claim'i
+    get_current_user tarafindan asla kabul edilmez, cunku o yalnizca Authorization header'ina
+    bakar — bu token URL'e gitmek ZORUNDA oldugu icin oraya hic girmez)."""
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": username,
+        "story_id": story_id,
+        "purpose": STREAM_TOKEN_PURPOSE,
+        "jti": secrets.token_urlsafe(16),
+        "exp": now + timedelta(seconds=STREAM_TOKEN_TTL_SECONDS),
+    }
+    return jwt.encode(payload, settings.jwt_secret, algorithm=ALGORITHM)
+
+
+def _consume_stream_token(token: str, story_id: int) -> str:
+    """Dogrular VE tuketir (jti'yi kullanilmis isaretler) — ikinci kullanim (log'dan/gecmisten
+    kopyalanmis olsa bile) reddedilir. Hata detaylari kasitli olarak jenerik: 'gecersiz mi,
+    suresi mi dolmus, zaten kullanilmis mi' ayrimi disariya sizdirilmaz."""
+    _prune_used_stream_jti()
+    try:
+        payload = jwt.decode(token, settings.jwt_secret, algorithms=[ALGORITHM])
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Gecersiz veya suresi dolmus stream token'i.")
+
+    if payload.get("purpose") != STREAM_TOKEN_PURPOSE or payload.get("story_id") != story_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Gecersiz stream token'i.")
+
+    jti = payload.get("jti")
+    username = payload.get("sub")
+    if not jti or not username:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Gecersiz stream token'i.")
+    if jti in _used_stream_jti:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Bu stream token'i zaten kullanildi.")
+
+    # exp zaten jwt.decode tarafindan dogrulandi; ayni sureyi burada da tutuyoruz ki
+    # _used_stream_jti kendiliginden (asagida budanan) kucuk kalsin.
+    _used_stream_jti[jti] = datetime.now(timezone.utc) + timedelta(seconds=STREAM_TOKEN_TTL_SECONDS)
+    return username
+
+
+async def get_stream_user(
+    story_id: IdPath, request: Request, db: AsyncSession = Depends(get_db)
+) -> User:
+    """SSE ucu icin get_current_user'in YERINE gecer — ana JWT'yi ASLA URL'den kabul etmez.
+    Yalnizca create_stream_token ile uretilmis, bu story_id'ye baglanmis, tek kullanimlik
+    token'i kabul eder."""
+    token = request.query_params.get("token")
+    if not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Giris yapmalisiniz.")
+    username = _consume_stream_token(token, story_id)
+    user = (await db.execute(select(User).where(User.username == username))).scalar_one_or_none()
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Kullanici bulunamadi.")
+    return user
 
 
 def get_llm_ctx(request: Request) -> LlmCtx:
